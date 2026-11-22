@@ -4,7 +4,7 @@ import { expect, it, vi } from "vitest";
 import { engineChannelSchema } from "@/api/engine";
 import { Providers } from "@/app/Providers";
 import { MockBackend } from "@/backend/mock";
-import { BackendError } from "@/backend/types";
+import { BackendError, type Backend } from "@/backend/types";
 import { IqCapture, LiveSelection } from "./Tuning";
 
 it("tunes an entered frequency, explains silence and reports a receive-window error", async () => {
@@ -120,4 +120,42 @@ it("offers original IQ separately from FM audio and preserves a stopped frequenc
     URL.createObjectURL = originalCreate;
     URL.revokeObjectURL = originalRevoke;
   }
+});
+
+it("moves the receiver window to a typed frequency outside it, then tunes", async () => {
+  const backend = new MockBackend({ manual: true });
+  const snapshot = await backend.status();
+  snapshot.state = "receiving";
+  snapshot.center_hz = 153.6e6;
+  snapshot.rate_hz = 25.6e6;
+  snapshot.bandwidth_hz = 20e6;
+  snapshot.source = { capabilities: { configure_supported: true } };
+  vi.spyOn(backend, "status").mockImplementation(async () => ({ ...snapshot }));
+  const configure = vi.spyOn(backend as Backend, "configureSource").mockImplementation(async (config) => {
+    snapshot.center_hz = config.centerHz;
+    return "Confirmed";
+  });
+  const tune = vi.spyOn(backend, "tune");
+  vi.spyOn(backend, "monitor").mockResolvedValue();
+  vi.spyOn(backend, "listen").mockReturnValue({ close() {} });
+  render(<Providers backend={backend}><LiveSelection /></Providers>);
+  const user = userEvent.setup();
+  // Inside the window: no move.
+  await user.type(screen.getByRole("textbox", { name: "Frequency (MHz)" }), "146.52");
+  await waitFor(() => expect(screen.getByRole("button", { name: "Tune" })).toBeEnabled());
+  await user.click(screen.getByRole("button", { name: "Tune" }));
+  await waitFor(() => expect(tune).toHaveBeenCalledWith(146520000, undefined, true));
+  expect(configure).not.toHaveBeenCalled();
+  // 446.0 is outside 143.6-163.6: the window moves to 435-455 (LO 445.0, 1 MHz below), then it tunes.
+  const input = screen.getByRole("textbox", { name: "Frequency (MHz)" });
+  await user.clear(input);
+  await user.type(input, "446.0");
+  await user.click(screen.getByRole("button", { name: "Tune" }));
+  await waitFor(() => expect(configure).toHaveBeenCalledWith({ centerHz: 445e6, rateHz: 25.6e6, bandwidthHz: 20e6 }));
+  await waitFor(() => expect(tune).toHaveBeenLastCalledWith(446000000, undefined, true));
+  // Near the edge (454.5 is within 1 MHz of 455): it moves again rather than tune on the filter skirt.
+  await user.clear(screen.getByRole("textbox", { name: "Frequency (MHz)" }));
+  await user.type(screen.getByRole("textbox", { name: "Frequency (MHz)" }), "454.5");
+  await user.click(screen.getByRole("button", { name: "Tune" }));
+  await waitFor(() => expect(configure).toHaveBeenLastCalledWith({ centerHz: 453.5e6, rateHz: 25.6e6, bandwidthHz: 20e6 }));
 });

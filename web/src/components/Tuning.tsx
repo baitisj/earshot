@@ -1,26 +1,60 @@
 import { useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { usePlayer, usePlayerInstance } from "@/app/player-context";
 import { SpeakerControls } from "@/components/PlayerBar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { useBackend, useSources } from "@/state/radio";
+import { keys, useBackend, useSources, useStatus } from "@/state/radio";
+import { centerFor, inWindow } from "./recenter";
 import { Square, Play } from "lucide-react";
 
 export function TuneForm({ initialHz }: { initialHz?: number }) {
   const [frequency, setFrequency] = useState(initialHz ? (initialHz / 1e6).toFixed(5) : "");
   const player = usePlayerInstance();
   const backend = useBackend();
+  const client = useQueryClient();
+  const { data: status } = useStatus();
+  const [note, setNote] = useState<string | null>(null);
   const hz = Number(frequency) * 1e6;
-  return <form className="flex items-center gap-1" onSubmit={(e) => {
+  const center = status?.center_hz ?? 0;
+  const rate = status?.rate_hz ?? 0;
+  const width = status?.bandwidth_hz ?? 0;
+  const capabilities = status?.source?.capabilities as Record<string, unknown> | undefined;
+  const canMove = status?.state === "receiving" && center > 0 && rate > 0 && width > 0
+    && (capabilities?.configure_supported === true
+      || (capabilities?.configure_supported == null && capabilities?.controls_supported === true));
+  const tune = useMutation({
+    mutationFn: async (target: number) => {
+      // Outside the receiver window: move the window there first (RX only), then tune.
+      if (canMove && !inWindow(target, { centerHz: center, widthHz: width })) {
+        const next = centerFor(target);
+        setNote(`Moving the window to ${((next - width / 2) / 1e6).toFixed(1)}–${((next + width / 2) / 1e6).toFixed(1)} MHz…`);
+        await player.stop();
+        await backend.configureSource({ centerHz: next, rateHz: rate, bandwidthHz: width });
+        // Wait for the producer's readback before tuning into the new window.
+        for (let i = 0; i < 20; i++) {
+          const fresh = await backend.status();
+          client.setQueryData(keys.status, fresh);
+          if (fresh.center_hz && inWindow(target, { centerHz: fresh.center_hz, widthHz: fresh.bandwidth_hz ?? width })) break;
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        void client.invalidateQueries({ queryKey: keys.blocks });
+      }
+      await player.listenFrequency(target);
+    },
+    onSettled: () => setNote(null),
+  });
+  return <form className="flex flex-wrap items-center gap-1" onSubmit={(e) => {
     e.preventDefault();
-    if (backend.tune && frequency.trim() && Number.isFinite(hz) && hz >= 70e6 && hz <= 6e9)
-      void player.listenFrequency(hz);
+    if (backend.tune && frequency.trim() && Number.isFinite(hz) && hz >= 70e6 && hz <= 6e9 && !tune.isPending)
+      tune.mutate(hz);
   }}>
     <Input aria-label="Frequency (MHz)" className="w-32 text-base tabular-nums" value={frequency}
       onChange={(e) => setFrequency(e.target.value)} inputMode="decimal" placeholder="Frequency" />
     <span className="text-xs text-muted-foreground">MHz</span>
-    <Button variant="secondary" type="submit" disabled={!backend.tune || !frequency.trim() || !Number.isFinite(hz) || hz < 70e6 || hz > 6e9}>Tune</Button>
+    <Button variant="secondary" type="submit" disabled={!backend.tune || tune.isPending || !frequency.trim() || !Number.isFinite(hz) || hz < 70e6 || hz > 6e9}>{tune.isPending ? "Tuning…" : "Tune"}</Button>
+    {note && <span role="status" className="text-xs text-muted-foreground">{note}</span>}
+    {tune.error && <span role="alert" className="text-xs text-destructive">{tune.error.message}</span>}
   </form>;
 }
 
