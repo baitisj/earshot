@@ -46,7 +46,9 @@ built with the hook patch below (an unpatched library fails to link).
 `patches/dsdcc-ambe-vocoder-hook.patch` to DSDcc, which lets the engine's own AMBE+2 decoder
 (`src/ambe`, a native port of the MD-380 firmware decoder; see `src/ambe/DESIGN.md`) replace
 mbelib's voice synthesis for DMR and NXDN; a DSDcc tree given through `DSDCC_INCLUDE_DIR` must
-carry the same patch. `--vocoder mbelib` falls back to mbelib. DSDcc is GPLv3 and mbelib is ISC;
+carry the same patch. `--vocoder mbelib` falls back to mbelib. The script also pins libopus (v1.5.2, live browser
+audio) and HamFLAC (saved audio as FLAC). libopus is BSD, HamFLAC is Artistic-2.0 and its
+dr_flac reader is public domain or MIT-0. DSDcc is GPLv3 and mbelib is ISC;
 notices are in `licenses/`. Rust wraps the existing C++/C algorithms through a
 small C ABI. The production data path does not invoke Python or decoder
 subprocesses.
@@ -248,7 +250,8 @@ are in `web/src/api/needs.ts` on the frontend branch.
   `{calls, next_before, in_progress}`, newest first; pass `next_before` back as `before`.
   A call: `id` (string), `source_id` (catalog source), `channel_id`, `protocol`, `slot`,
   `frequency_hz`, `label`, `started_at`, `ended_at` (null while in progress), `duration_s`,
-  `level_db`, `audio_url` (`/api/calls/{id}/audio.wav`, 8 kHz mono signed16 WAV, null in
+  `level_db`, `audio_url` (`/api/calls/{id}/audio.flac`, 8 kHz mono 16-bit FLAC encoded on request from
+the stored WAV; `/audio.wav` still serves the WAV, null in
   progress), `talker` and `transcript` (null), `encrypted` (false). Every speaking channel is
   recorded, not only the one being heard. A call ends 2 s after its audio stops, is split at 10
   minutes, and bursts under 0.8 s are discarded with no events at all. `WS /api/events` sends
@@ -348,7 +351,12 @@ seconds; ids are strings.
      `{calls: [{id, source_id, channel_id, started_at, ended_at|null,
      encrypted, audio_url|null, talker|null, transcript|null}],
      next_before: <unix s>|null}`, newest first.
-   - `GET <audio_url>` → `audio/ogg; codecs=opus` (or WAV), seekable.
+   - `GET <audio_url>` → `audio/flac` (`/audio.wav` for the stored WAV).
+   - `WS /api/listen?codec=opus` → a JSON `{"type":"opus",...}` descriptor whenever the stream
+     changes, then binary messages of 20 ms Opus packets, each after a little-endian u16
+     length. 16 kbit/s at 8 kHz, 24 kbit/s wideband for raw FM. Without `codec`, s16le PCM.
+   - `GET /api/captures/{channel}/audio.flac?seconds=N` → the newest N seconds of raw FM
+     discriminator (48 kHz, lossless, up to two minutes), with its gaps in a Vorbis comment.
    - `{type:"call", call}` on `/api/events` when a call starts and ends.
    - `talker` is for trunking (radio ID) and `transcript` for later STT; both
      null for now. Retention can be time- or size-bounded; say which.

@@ -272,6 +272,8 @@ async fn spectrum(State(app): State<App>, Query(q): Query<After>) -> Json<Value>
 #[derive(Deserialize)]
 struct Listen {
     channel_id: Option<String>,
+    /// `opus` asks for Opus packets (see `crate::opus`); anything else gets s16le PCM.
+    codec: Option<String>,
 }
 /// Audio for one browser. With `?channel_id=` this socket listens to that channel on its
 /// own (several browsers can listen to different channels at once); without it the socket
@@ -303,8 +305,9 @@ async fn ws(State(app): State<App>, Query(q): Query<Listen>, ws: WebSocketUpgrad
         return api_error(StatusCode::TOO_MANY_REQUESTS, "too many listeners").into_response();
     }
     let guard = guard.flatten();
+    let opus = (q.codec.as_deref() == Some("opus")).then(crate::opus::LiveOpus::default);
     ws.max_message_size(8192)
-        .on_upgrade(move |s| socket(s, app, requested, guard))
+        .on_upgrade(move |s| socket(s, app, requested, guard, opus))
         .into_response()
 }
 static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -321,7 +324,7 @@ impl Drop for ListenerGuard {
         sync_pins(&mut e);
     }
 }
-async fn socket(mut socket: WebSocket, app: App, requested: Option<String>, _guard: Option<ListenerGuard>) {
+async fn socket(mut socket: WebSocket, app: App, requested: Option<String>, _guard: Option<ListenerGuard>, mut opus: Option<crate::opus::LiveOpus>) {
     let joined = Instant::now();
     let mut rx = app.audio.subscribe();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -334,11 +337,18 @@ async fn socket(mut socket: WebSocket, app: App, requested: Option<String>, _gua
                         let since=if requested.is_some(){joined}else{e.selected_at};
                         e.active&&a.meta["source_generation"]==e.generation&&a.meta["channel_id"].as_str()==want.as_deref()&&a.created>=since};
                     if current {
-        if a.created.elapsed()>Duration::from_millis(250){if socket.send(Message::Text(json!({"type":"gap","reason":"audio_expired"}).to_string().into())).await.is_err(){break;}continue;}
-        let sent=tokio::time::timeout(Duration::from_millis(250),async{socket.send(Message::Text(a.meta.to_string().into())).await?;socket.send(Message::Binary(a.pcm.into())).await}).await;
+        if a.created.elapsed()>Duration::from_millis(250){if let Some(live)=opus.as_mut(){live.gap();}if socket.send(Message::Text(json!({"type":"gap","reason":"audio_expired"}).to_string().into())).await.is_err(){break;}continue;}
+        let encoded=opus.as_mut().and_then(|live|live.push(&a.meta,&a.pcm));
+        let sent=tokio::time::timeout(Duration::from_millis(250),async{
+            if let Some(out)=encoded{
+                if let Some(descriptor)=out.descriptor{socket.send(Message::Text(descriptor.into())).await?;}
+                if !out.packets.is_empty(){socket.send(Message::Binary(out.packets.into())).await?;}
+                return Ok(());
+            }
+            socket.send(Message::Text(a.meta.to_string().into())).await?;socket.send(Message::Binary(a.pcm.into())).await}).await;
         if !matches!(sent,Ok(Ok(()))){break;}
-        }},Err(broadcast::error::RecvError::Lagged(n))=>{rx=app.audio.subscribe();if socket.send(Message::Text(json!({"type":"gap","dropped_chunks":n}).to_string().into())).await.is_err(){break;}},Err(_)=>break}},
-                _=tick.tick()=>{let value={let e=app.engine();json!({"type":"heartbeat","generation":e.decoder_generation,"source_generation":e.generation,"channel_id":requested.clone().or_else(||e.selected.clone()),"listeners":e.listeners.len()})};if !matches!(tokio::time::timeout(Duration::from_millis(250),socket.send(Message::Text(value.to_string().into()))).await,Ok(Ok(()))){break;}},
+        }},Err(broadcast::error::RecvError::Lagged(n))=>{if let Some(live)=opus.as_mut(){live.gap();}rx=app.audio.subscribe();if socket.send(Message::Text(json!({"type":"gap","dropped_chunks":n}).to_string().into())).await.is_err(){break;}},Err(_)=>break}},
+                _=tick.tick()=>{if let Some(live)=opus.as_mut(){live.tick();}let value={let e=app.engine();json!({"type":"heartbeat","generation":e.decoder_generation,"source_generation":e.generation,"channel_id":requested.clone().or_else(||e.selected.clone()),"listeners":e.listeners.len()})};if !matches!(tokio::time::timeout(Duration::from_millis(250),socket.send(Message::Text(value.to_string().into()))).await,Ok(Ok(()))){break;}},
                 msg=socket.recv()=>{if matches!(msg,None|Some(Err(_))|Some(Ok(Message::Close(_)))){break;}}
                }
     }
@@ -564,6 +574,74 @@ async fn call_audio(State(app): State<App>, Path(id): Path<String>) -> axum::res
             .into_response(),
         // 410, not 404: the frontend reads 404 as "endpoint not built yet".
         None => api_error(StatusCode::GONE, "no audio for that call").into_response(),
+    }
+}
+/// A call as FLAC. Calls stay WAV on disk, so this encodes on request.
+async fn call_audio_flac(State(app): State<App>, Path(id): Path<String>) -> axum::response::Response {
+    let source = id.parse::<u64>().ok().and_then(|n| app.engine().store.audio_source(n));
+    let Some(source) = source else {
+        return api_error(StatusCode::GONE, "no audio for that call").into_response();
+    };
+    let bytes = tokio::task::spawn_blocking(move || match source {
+        AudioSource::Memory(samples) => crate::flac::encode(&samples, crate::store::AUDIO_RATE),
+        AudioSource::File(path) => {
+            let samples = crate::store::wav_samples(&std::fs::read(path).ok()?)?;
+            crate::flac::encode(&samples, crate::store::AUDIO_RATE)
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    match bytes {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("audio/flac")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=3600")),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => api_error(StatusCode::GONE, "no audio for that call").into_response(),
+    }
+}
+#[derive(Deserialize)]
+struct CaptureQuery {
+    /// Only the newest this many seconds (what this browser heard).
+    seconds: Option<f64>,
+}
+/// The raw FM discriminator recently heard on a channel, lossless, as FLAC.
+async fn raw_capture(State(app): State<App>, Path(id): Path<String>, Query(q): Query<CaptureQuery>) -> axum::response::Response {
+    let (snapshot, frequency_hz) = {
+        let e = app.engine();
+        (e.captures.snapshot(&id, q.seconds), e.channels.get(&id).map(|c| c["frequency_hz"].clone()))
+    };
+    let Some(snapshot) = snapshot else {
+        return api_error(StatusCode::GONE, "no capture for that channel").into_response();
+    };
+    let bytes = tokio::task::spawn_blocking(move || {
+        let flac = crate::flac::encode(&snapshot.samples, crate::capture::RATE)?;
+        let details = json!({
+            "frequency_hz": frequency_hz, "mode": "raw FM discriminator",
+            "sample_rate_hz": crate::capture::RATE, "channel_bandwidth_hz": 11250,
+            "processing": "channel filter, FM demodulation and DC removal; no squelch or de-emphasis",
+            "continuity": "host transport checked; ADC continuity unknown",
+            "gaps": snapshot.gaps.iter().map(|(sample, reason)| json!({"sample":sample,"reason":reason})).collect::<Vec<_>>(),
+        });
+        crate::flac::with_comments(flac, &[("TITLE", "raw FM discriminator".to_string()), ("COMMENT", details.to_string())])
+    })
+    .await
+    .ok()
+    .flatten();
+    match bytes {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("audio/flac")),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => api_error(StatusCode::GONE, "no capture for that channel").into_response(),
     }
 }
 /// Catalog source id for a channel entry: the calibrated nominal frequency and slot, so it
@@ -855,6 +933,8 @@ pub fn router(app: App, web_dir: Option<PathBuf>) -> Router {
         .route("/api/spectrum.bin", get(spectrum_bin))
         .route("/api/calls", get(calls))
         .route("/api/calls/{id}/audio.wav", get(call_audio))
+        .route("/api/calls/{id}/audio.flac", get(call_audio_flac))
+        .route("/api/captures/{id}/audio.flac", get(raw_capture))
         .route("/api/catalog", get(catalog))
         .route("/api/catalog/{id}", axum::routing::put(catalog_edit))
         .route("/api/activity", get(activity))
@@ -997,7 +1077,12 @@ mod tests {
         assert_eq!(page2["calls"][0]["channel_id"], "454018750-DMR-2");
         assert!(page2["next_before"].is_null());
         let url = items[0]["audio_url"].as_str().unwrap().to_string();
-        let id = url.trim_start_matches("/api/calls/").trim_end_matches("/audio.wav").to_string();
+        let id = url.trim_start_matches("/api/calls/").trim_end_matches("/audio.flac").to_string();
+        let flac = call_audio_flac(State(app.clone()), Path(id.clone())).await;
+        assert_eq!(flac.status(), StatusCode::OK);
+        assert_eq!(flac.headers()[header::CONTENT_TYPE], "audio/flac");
+        let flac = axum::body::to_bytes(flac.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&flac[..4], b"fLaC");
         let response = call_audio(State(app.clone()), Path(id)).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");

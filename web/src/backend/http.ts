@@ -6,11 +6,13 @@ import {
   listenMessageSchema,
   parseJson,
   type AudioDescriptor,
+  type OpusDescriptor,
 } from "@/api/engine";
 import { activitySchema, blocksSchema, callsSchema, catalogSchema } from "@/api/needs";
 import { z } from "zod";
 import { decodeRsp1, fromJson } from "./spectrum";
-import { BackendError, type Backend, type CallQuery, type ListenHandlers, type Need } from "./types";
+import { splitPackets } from "@/audio/opus";
+import { BackendError, type Backend, type CallQuery, type ListenHandlers, type ListenOptions, type Need } from "./types";
 
 function wsUrl(path: string) {
   return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}${path}`;
@@ -158,16 +160,25 @@ export class HttpBackend implements Backend {
     return response.blob();
   }
 
-  listen(handlers: ListenHandlers) {
-    const socket = new WebSocket(wsUrl("/api/listen"));
+  captureUrl(channelId: string, seconds: number) {
+    return `/api/captures/${encodeURIComponent(channelId)}/audio.flac?seconds=${seconds}`;
+  }
+
+  listen(handlers: ListenHandlers, options?: ListenOptions) {
+    const socket = new WebSocket(wsUrl(options?.opus ? "/api/listen?codec=opus" : "/api/listen"));
     socket.binaryType = "arraybuffer";
     let pending: AudioDescriptor | null = null;
+    let stream: OpusDescriptor | null = null;
     socket.onmessage = (message) => {
       if (message.data instanceof ArrayBuffer) {
         const descriptor = pending;
         pending = null;
-        if (!descriptor || message.data.byteLength !== descriptor.samples * 2) return;
-        handlers.onAudio(descriptor, new Int16Array(message.data));
+        if (descriptor) {
+          if (message.data.byteLength === descriptor.samples * 2) handlers.onAudio(descriptor, new Int16Array(message.data));
+          return;
+        }
+        const packets = stream && splitPackets(new Uint8Array(message.data));
+        if (stream && packets?.length) handlers.onOpus?.(stream, packets);
         return;
       }
       if (typeof message.data !== "string") return;
@@ -175,6 +186,7 @@ export class HttpBackend implements Backend {
       pending = null;
       if (!parsed) return;
       if (parsed.type === "audio") pending = parsed;
+      else if (parsed.type === "opus") stream = parsed;
       else if (parsed.type === "heartbeat") handlers.onHeartbeat(parsed.channel_id ?? null);
       else handlers.onGap();
     };

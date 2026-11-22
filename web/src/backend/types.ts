@@ -1,13 +1,20 @@
-import type { AudioDescriptor, EngineChannel, EngineEvent, EngineStatus } from "@/api/engine";
+import type { AudioDescriptor, EngineChannel, EngineEvent, EngineStatus, OpusDescriptor } from "@/api/engine";
 import type { WireActivity, WireBlocks, WireCall, WireCatalogEntry } from "@/api/needs";
 import type { SpectrumBatch } from "@/domain/model";
 
 export interface ListenHandlers {
   onAudio(descriptor: AudioDescriptor, pcm: Int16Array): void;
+  /** Opus packets, when the listen asked for them and the backend sends them. */
+  onOpus?(descriptor: OpusDescriptor, packets: Uint8Array[]): void;
   /** The engine's current selection; it is shared by every connected browser. */
   onHeartbeat(channelId: string | null): void;
   onGap(): void;
   onClose(): void;
+}
+
+export interface ListenOptions {
+  /** Ask for Opus. A backend without it keeps sending PCM to onAudio. */
+  opus?: boolean;
 }
 
 export interface Connection {
@@ -49,7 +56,9 @@ export interface Backend {
   /** Operator: add a true-frequency target inside an advertised receiver slice. */
   /** `mode` "usb"/"lsb" listens in single sideband (implies raw). */
   tune?(frequencyHz: number, channelId?: string, raw?: boolean, mode?: "usb" | "lsb"): Promise<EngineChannel>;
-  listen(handlers: ListenHandlers): Connection;
+  listen(handlers: ListenHandlers, options?: ListenOptions): Connection;
+  /** Lossless FLAC of the newest raw audio the engine holds for a channel. */
+  captureUrl?(channelId: string, seconds: number): string;
   iqCaptureStatus?(channelId: string): Promise<IqCaptureStatus | null>;
   downloadIq?(channelId: string): Promise<Blob>;
   /** Operator: stop the receiver (not just the listener). */
