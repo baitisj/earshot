@@ -1,4 +1,5 @@
 import { COLORMAP } from "./colormap";
+import type { LensUniforms } from "./lens";
 
 /**
  * Waterfall renderer. Rows go into a ring texture (one row per spectrum line,
@@ -6,8 +7,26 @@ import { COLORMAP } from "./colormap";
  * Native bins and rows are drawn without interpolation or temporal smearing. Falls back to
  * a 2D canvas when WebGL2 is unavailable.
  */
+/** Where the fine rows sit, in units of the window span from its low edge. */
+export interface FineGeometry {
+  /** Physical center of the fine slice. */
+  center: number;
+  /** Its sample rate: the rows span center ± width/2. */
+  width: number;
+  /** Fine data is drawn only within this distance of the lens focus (the core). */
+  reach: number;
+  /** Bins per row. */
+  bins: number;
+}
+
 export interface Renderer {
-  push(row: Uint8Array): void;
+  /** A waterfall row; `sequence` lets fine rows for the same moment find it. */
+  push(row: Uint8Array, sequence?: number): void;
+  /** A fine row for the waterfall row with this sequence (ignored once it has scrolled away). */
+  pushFine(sequence: number, row: Uint8Array): void;
+  /** Lens warp, or null for the linear scale. */
+  setLens(lens: LensUniforms | null): void;
+  setFine(geometry: FineGeometry | null): void;
   resize(width: number, height: number): void;
   draw(): void;
   dispose(): void;
@@ -23,17 +42,49 @@ precision highp float;
 in vec2 uv;
 uniform sampler2D rows;
 uniform sampler2D colormap;
+uniform sampler2D fine;
 uniform float newest;
 uniform float visible;
 uniform float capacity;
 uniform float floorLevel;
 uniform float ceilLevel;
+uniform int lensOn;
+uniform float focus;
+uniform float coreSpan;
+uniform float coreFrac;
+uniform float growth;
+uniform float tailScale;
+uniform int fineOn;
+uniform float fineCenter;
+uniform float fineWidth;
+uniform float fineReach;
+uniform float fineFloor;
+uniform float fineCeil;
 out vec4 color;
+// Window position (0..1 of the span) shown at screen position x; see lens.ts.
+float windowAt(float x) {
+  if (lensOn == 0) return x;
+  float u = abs(x - 0.5) * 2.0;
+  float d = u <= coreFrac ? coreSpan * u / coreFrac : coreSpan + tailScale * (exp(growth * (u - coreFrac)) - 1.0);
+  return focus + sign(x - 0.5) * d;
+}
+vec4 shade(float v, float lo, float hi) {
+  return texture(colormap, vec2(clamp((v - lo) / max(0.02, hi - lo), 0.0, 1.0), 0.5));
+}
 void main() {
+  float f = windowAt(uv.x);
+  if (f < 0.0 || f > 1.0) { color = vec4(0.059, 0.102, 0.169, 1.0); return; }
   float r = mod(newest - floor(uv.y * visible) + capacity, capacity);
-  float v = texture(rows, vec2(uv.x, (r + 0.5) / capacity)).r;
-  float t = clamp((v - floorLevel) / max(0.02, ceilLevel - floorLevel), 0.0, 1.0);
-  color = texture(colormap, vec2(t, 0.5));
+  float t = (r + 0.5) / capacity;
+  if (fineOn == 1 && abs(f - focus) <= fineReach) {
+    float fu = 0.5 + (f - fineCenter) / fineWidth;
+    // Only the slice's flat middle (±35 of ±50 kHz); past it the channelizer rolls off.
+    if (fu >= 0.15 && fu <= 0.85) {
+      float v = texture(fine, vec2(fu, t)).r;
+      if (v > 0.0) { color = shade(v, fineFloor, fineCeil); return; }
+    }
+  }
+  color = shade(texture(rows, vec2(f, t)).r, floorLevel, ceilLevel);
 }`;
 
 export interface RendererOptions {
@@ -128,23 +179,85 @@ function webgl(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, o: Rendere
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 
+  let fine: WebGLTexture | null = null;
+  let fineBins = 0;
+  const allocFine = (bins: number) => {
+    if (fine && fineBins === bins) return;
+    if (fine) gl.deleteTexture(fine);
+    fine = gl.createTexture();
+    fineBins = bins;
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, fine);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, bins, o.capacity, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(bins * o.capacity));
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  };
+  allocFine(1);
+
   const u = (name: string) => gl.getUniformLocation(program, name);
   gl.uniform1i(u("rows"), 0);
   gl.uniform1i(u("colormap"), 1);
+  gl.uniform1i(u("fine"), 2);
+  gl.uniform1i(u("lensOn"), 0);
+  gl.uniform1i(u("fineOn"), 0);
   gl.uniform1f(u("capacity"), o.capacity);
   gl.uniform1f(u("visible"), o.visible);
 
   let newest = 0;
   const levels = new Levels();
+  const fineLevels = new Levels();
   const smoother = new Smoother(o.smoothing ?? 1);
+  // Waterfall sequence held in each ring slot, so a fine row lands beside its moment.
+  const slotSequence = new Float64Array(o.capacity).fill(-1);
+  let blank = new Uint8Array(fineBins);
+  let fineOn = false;
   return {
-    push(row) {
+    push(row, sequence) {
       if (row.length !== o.bins) return;
       const smoothed = smoother.apply(row);
       levels.update(smoothed);
       newest = (newest + 1) % o.capacity;
+      slotSequence[newest] = sequence ?? -1;
       gl.activeTexture(gl.TEXTURE0);
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, newest, o.bins, 1, gl.RED, gl.UNSIGNED_BYTE, smoothed);
+      // The slot's old fine row belongs to a moment long gone: 0 means "no fine data".
+      if (blank.length !== fineBins) blank = new Uint8Array(fineBins);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, newest, fineBins, 1, gl.RED, gl.UNSIGNED_BYTE, blank);
+    },
+    pushFine(sequence, row) {
+      if (!fineOn || row.length !== fineBins) return;
+      for (let i = 0; i < o.capacity; i++) {
+        const slot = (newest - i + o.capacity) % o.capacity;
+        if (slotSequence[slot] !== sequence) continue;
+        fineLevels.update(row);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, slot, fineBins, 1, gl.RED, gl.UNSIGNED_BYTE, row);
+        return;
+      }
+    },
+    setLens(lens) {
+      gl.uniform1i(u("lensOn"), lens ? 1 : 0);
+      if (!lens) return;
+      gl.uniform1f(u("focus"), lens.focus);
+      gl.uniform1f(u("coreSpan"), lens.coreSpan);
+      gl.uniform1f(u("coreFrac"), lens.core);
+      gl.uniform1f(u("growth"), lens.k);
+      gl.uniform1f(u("tailScale"), lens.b);
+    },
+    setFine(geometry) {
+      fineOn = !!geometry;
+      gl.uniform1i(u("fineOn"), geometry ? 1 : 0);
+      if (!geometry) return;
+      if (geometry.bins !== fineBins) {
+        allocFine(geometry.bins);
+        blank = new Uint8Array(fineBins);
+      }
+      gl.uniform1f(u("fineCenter"), geometry.center);
+      gl.uniform1f(u("fineWidth"), geometry.width);
+      gl.uniform1f(u("fineReach"), geometry.reach);
     },
     resize(width, height) {
       canvas.width = width;
@@ -155,11 +268,14 @@ function webgl(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, o: Rendere
       gl.uniform1f(u("newest"), newest);
       gl.uniform1f(u("floorLevel"), levels.floor);
       gl.uniform1f(u("ceilLevel"), levels.ceil);
+      gl.uniform1f(u("fineFloor"), fineLevels.floor);
+      gl.uniform1f(u("fineCeil"), fineLevels.ceil);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     },
     dispose() {
       gl.deleteTexture(rows);
       gl.deleteTexture(lut);
+      if (fine) gl.deleteTexture(fine);
       gl.deleteBuffer(buffer);
       gl.deleteProgram(program);
     },
@@ -171,6 +287,7 @@ function canvas2d(canvas: HTMLCanvasElement, o: RendererOptions): Renderer {
   const history: Uint8Array[] = [];
   const levels = new Levels();
   const smoother = new Smoother(o.smoothing ?? 1);
+  let lens: LensUniforms | null = null;
   return {
     push(row) {
       const smoothed = smoother.apply(row);
@@ -178,20 +295,37 @@ function canvas2d(canvas: HTMLCanvasElement, o: RendererOptions): Renderer {
       history.unshift(smoothed);
       if (history.length > o.visible) history.pop();
     },
+    // No fine rows here: the fallback stretches the wideband bins only.
+    pushFine() {},
+    setLens(next) { lens = next; },
+    setFine() {},
     resize(width, height) {
       canvas.width = width;
       canvas.height = height;
     },
     draw() {
       if (!ctx || !history.length) return;
-      const width = o.bins;
+      const width = lens ? Math.max(1, Math.min(canvas.width, 2048)) : o.bins;
+      // Bin shown in each output column (-1: outside the window).
+      const column = Int32Array.from({ length: width }, (_, x) => {
+        if (!lens) return x;
+        const sx = (x + 0.5) / width;
+        const u = Math.abs(sx - 0.5) * 2;
+        const d = u <= lens.core ? lens.coreSpan * u / lens.core : lens.coreSpan + lens.b * Math.expm1(lens.k * (u - lens.core));
+        const f = lens.focus + Math.sign(sx - 0.5) * d;
+        return f < 0 || f > 1 ? -1 : Math.min(o.bins - 1, Math.floor(f * o.bins));
+      });
       const image = ctx.createImageData(width, o.visible);
       const span = Math.max(0.02, levels.ceil - levels.floor);
       history.forEach((row, y) => {
         for (let x = 0; x < width; x++) {
-          const t = Math.min(1, Math.max(0, (row[x] / 255 - levels.floor) / span));
-          const c = Math.round(t * 255) * 4;
           const i = (y * width + x) * 4;
+          if (column[x] < 0) {
+            image.data.set([15, 26, 43, 255], i);
+            continue;
+          }
+          const t = Math.min(1, Math.max(0, (row[column[x]] / 255 - levels.floor) / span));
+          const c = Math.round(t * 255) * 4;
           image.data[i] = COLORMAP[c];
           image.data[i + 1] = COLORMAP[c + 1];
           image.data[i + 2] = COLORMAP[c + 2];

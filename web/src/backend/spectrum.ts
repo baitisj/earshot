@@ -1,6 +1,7 @@
 import type { EngineSpectrum } from "@/api/engine";
 import { RSP1_HEADER } from "@/api/needs";
 import type { SpectrumBatch, SpectrumRow } from "@/domain/model";
+import type { FineSpectrum } from "./types";
 
 export function scaleToByte(db: number, low: number, high: number): number {
   if (!Number.isFinite(db)) return 0;
@@ -62,6 +63,34 @@ export function decodeRsp1(buffer: ArrayBuffer): SpectrumBatch | null {
     lowDb: view.getFloat32(24, true),
     highDb: view.getFloat32(28, true),
     unit: "dB",
+    sequence: Number(view.getBigUint64(32, true)),
+    rows,
+  };
+}
+
+export const FSP1_HEADER = 40;
+
+/** Decode an FSP1 message (engine GET /api/iq/{id}/spectrum.bin). Returns null when malformed. */
+export function decodeFsp1(buffer: ArrayBuffer): FineSpectrum | null {
+  if (buffer.byteLength < FSP1_HEADER) return null;
+  const view = new DataView(buffer);
+  const magic = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+  if (magic !== "FSP1") return null;
+  const bins = view.getUint16(4, true);
+  const count = view.getUint16(6, true);
+  const stride = 8 + bins;
+  if (bins === 0 || buffer.byteLength !== FSP1_HEADER + count * stride) return null;
+  const rows = Array.from({ length: count }, (_, r) => {
+    const offset = FSP1_HEADER + r * stride;
+    return { sequence: Number(view.getBigUint64(offset, true)), bins: new Uint8Array(buffer, offset + 8, bins) };
+  });
+  const centerHz = view.getFloat64(8, true);
+  const rateHz = view.getFloat64(16, true);
+  if (!(centerHz > 0) || !(rateHz > 0)) return null;
+  return {
+    centerHz, rateHz, bins,
+    lowDb: view.getFloat32(24, true),
+    highDb: view.getFloat32(28, true),
     sequence: Number(view.getBigUint64(32, true)),
     rows,
   };

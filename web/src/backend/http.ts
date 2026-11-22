@@ -10,7 +10,7 @@ import {
 } from "@/api/engine";
 import { activitySchema, blocksSchema, callsSchema, catalogSchema } from "@/api/needs";
 import { z } from "zod";
-import { decodeRsp1, fromJson } from "./spectrum";
+import { decodeFsp1, decodeRsp1, fromJson } from "./spectrum";
 import { splitPackets } from "@/audio/opus";
 import { BackendError, type Backend, type CallQuery, type ListenHandlers, type ListenOptions, type Need } from "./types";
 
@@ -153,6 +153,14 @@ export class HttpBackend implements Backend {
       center_hz: z.number().nullable(), stream_id: z.number().nullable(), max_seconds: z.number(),
       last_received_at: z.number().nullable(),
     }));
+  }
+
+  async fineSpectrum(channelId: string, after: number) {
+    const response = await fetch(`/api/iq/${encodeURIComponent(channelId)}/spectrum.bin?after=${after}`, { signal: AbortSignal.timeout(4000) });
+    // 410: nothing buffered for this channel (or it left the catalog); 404: an older engine.
+    if (response.status === 410 || notBuilt(response.status)) return null;
+    if (!response.ok) throw new BackendError(`fine spectrum ${response.status}`, response.status);
+    return decodeFsp1(await response.arrayBuffer());
   }
 
   async downloadIq(channelId: string) {

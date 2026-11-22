@@ -46,7 +46,7 @@ export function Exploration() {
     <ResizablePanel id="spectrum" defaultSize="74%" minSize="30%" className="flex min-h-0">
     <div className="relative flex min-h-0 flex-1">
       <Waterfall variant="full" sources={sources} talking={new Map()} activeSourceId={active ? state.sourceId : null}
-        tunedFrequencyHz={state.frequencyHz} captureRange={range}
+        tunedFrequencyHz={state.frequencyHz} captureRange={range} iqChannelId={active ? state.channelId : null}
         onListen={(s) => void player.listen(s, { raw: !s.heardVoice || s.control || s.encryption === "encrypted" })} onUnnamed={(hz) => void player.listenFrequency(hz)} className="min-h-0 min-w-0 flex-1 rounded-none" />
       {browse && <aside aria-label="Channels" className="absolute inset-y-0 left-0 z-10 flex w-80 max-w-full flex-col border-r border-border bg-background/95 shadow-xl backdrop-blur">
         <div className="flex items-center gap-2 p-2"><Input aria-label="Search channels" placeholder="Name, frequency, protocol" value={search} onChange={(e) => setSearch(e.target.value)} /><Button variant="ghost" size="icon" aria-label="Close channels" onClick={() => setBrowse(false)}><X /></Button></div>
