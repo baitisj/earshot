@@ -86,7 +86,9 @@ export class OpusStream {
       data.copyTo(f32, { planeIndex: 0, format: "f32-planar" });
       const pcm = new Int16Array(n);
       for (let i = 0; i < n; i++) pcm[i] = Math.max(-32768, Math.min(32767, Math.round(f32[i] * 32768)));
-      this.onPcm({ ...descriptor, encoding: "s16le", samples: n }, pcm);
+      // Browsers may decode at their own rate (Chromium always gives 48 kHz), so pass on the
+      // decoder's rate, not the packet's: the player's worklet resamples whatever it gets.
+      this.onPcm({ ...descriptor, encoding: "s16le", rate_hz: data.sampleRate || descriptor.rate_hz, samples: n }, pcm);
     } finally {
       data.close();
     }

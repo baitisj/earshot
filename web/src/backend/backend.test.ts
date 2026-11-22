@@ -161,6 +161,7 @@ describe("HttpBackend", () => {
         const bytes = new Uint8Array(chunk.data);
         this.output({
           numberOfFrames: bytes.length,
+          sampleRate: 48000,
           copyTo: (dest: Float32Array) => bytes.forEach((_, i) => (dest[i] = 0.5)),
           close: () => {},
         });
@@ -184,7 +185,7 @@ describe("HttpBackend", () => {
     socket.onmessage!({ data: new Uint8Array([1, 2, 3]).buffer });
     expect(decoded).toEqual([[8000]]);
     expect(onAudio).toHaveBeenCalledOnce();
-    expect(onAudio.mock.calls[0][0]).toMatchObject({ encoding: "s16le", samples: 3, channel_id: "A-1" });
+    expect(onAudio.mock.calls[0][0]).toMatchObject({ encoding: "s16le", rate_hz: 48000, samples: 3, channel_id: "A-1" });
     expect(Array.from(onAudio.mock.calls[0][1] as Int16Array)).toEqual([16384, 16384, 16384]);
     // A packet whose size doesn't match its descriptor is dropped; raw PCM still passes through.
     socket.onmessage!({ data: JSON.stringify(descriptor) });
