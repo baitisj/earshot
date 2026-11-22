@@ -125,6 +125,9 @@ pub(crate) struct Engine {
     pub(crate) listener: Value,
     pub(crate) psd: VecDeque<(u64, f64, Vec<f32>)>,
     pub(crate) psd_seq: u64,
+    /// Host arrival time of each retained PSD row, by sequence, so the IQ of a listened
+    /// stream can be cut to the same moments (api::iq_spectrum_bin).
+    pub(crate) psd_host: VecDeque<(u64, f64)>,
     /// Waterfall range last handed to clients (see api::held_range).
     pub(crate) psd_range: Option<(f64, f64)>,
     pub(crate) started: Option<f64>,
@@ -171,6 +174,7 @@ impl App {
                 listener: json!({"status":"stopped","state":"stopped","voice_active":false,"audio_chunks":0,"sequence":0,"dropped_blocks":0,"input_dropped":0,"queue_blocks":0,"error":null}),
                 psd: VecDeque::new(),
                 psd_seq: 0,
+                psd_host: VecDeque::new(),
                 psd_range: None,
                 started: None,
                 error: None,
@@ -1152,6 +1156,7 @@ pub fn ingest(mut input: impl Read, app: App) -> Result<()> {
                 e.pinned_streams.clear(); // a new source generation starts with nothing pinned
                 e.decoder_generation += 1;
                 e.psd.clear();
+                e.psd_host.clear();
                 e.psd_range = None;
                 if e.started.is_none() {
                     e.started = Some(now());
@@ -1420,11 +1425,15 @@ pub fn ingest(mut input: impl Read, app: App) -> Result<()> {
                     frame.first_sample as f64 / frame.rate.max(1) as f64,
                     row,
                 ));
+                e.psd_host.push_back((seq, now()));
                 let _ = app.events.send(
                     json!({"type":"spectrum_available","generation":e.generation,"sequence":seq}),
                 );
                 while e.psd.len() > 120 {
                     e.psd.pop_front();
+                }
+                while e.psd_host.len() > 120 {
+                    e.psd_host.pop_front();
                 }
             }
             3 => {

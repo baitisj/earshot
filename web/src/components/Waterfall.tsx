@@ -7,6 +7,9 @@ import { cn } from "@/lib/utils";
 import { createRenderer, type Renderer } from "@/waterfall/renderer";
 import { onSpectrumRows, spectrumRows, useSpectrumMeta } from "@/waterfall/feed";
 import { historyTicks } from "@/waterfall/ticks";
+import { LENS_CORE_HZ, lensScale, lensTicks, lensUniforms, linearScale } from "@/waterfall/lens";
+import { useFineSpectrum } from "@/waterfall/fine";
+import { prefs, usePrefs } from "@/state/prefs";
 
 interface Props {
   variant: "strip" | "full";
@@ -21,12 +24,14 @@ interface Props {
   /** Full view only: tapped a trace with no source nearby. */
   onUnnamed?(frequencyHz: number): void;
   captureRange?: { centerHz: number; spanHz: number } | null;
+  /** Full view: the listened channel, whose IQ gives the lens its fine detail. */
+  iqChannelId?: string | null;
   className?: string;
 }
 
 const HIT_PX = 22;
 
-export function Waterfall({ variant, sources, talking, activeSourceId, tunedFrequencyHz, onListen, onUnnamed, captureRange, className }: Props) {
+export function Waterfall({ variant, sources, talking, activeSourceId, tunedFrequencyHz, onListen, onUnnamed, captureRange, iqChannelId, className }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const drag = useRef<{ pointerId: number; lastTune: number; frequency: number | null } | null>(null);
   const box = useRef<HTMLDivElement>(null);
@@ -37,6 +42,41 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
   const [height, setHeight] = useState(0);
   const [hover, setHover] = useState<WaterfallPick | null>(null);
   const visible = variant === "strip" ? 60 : 300;
+  const renderer = useRef<Renderer | null>(null);
+  const redraw = useRef(() => {});
+  const lensOn = usePrefs().lens && variant === "full";
+  const [fineLive, setFineLive] = useState(false);
+
+  const low = meta.centerHz !== null && meta.spanHz !== null ? meta.centerHz - meta.spanHz / 2 : null;
+  const inWindow = (hz: number | null | undefined): hz is number =>
+    hz != null && low !== null && meta.spanHz !== null && hz >= low && hz <= low + meta.spanHz;
+  const focusHz = inWindow(tunedFrequencyHz) ? tunedFrequencyHz : meta.centerHz;
+  const scale = useMemo(() => {
+    if (low === null || !meta.spanHz) return null;
+    return lensOn && focusHz !== null ? lensScale(low, meta.spanHz, focusHz) : linearScale(low, meta.spanHz);
+  }, [low, meta.spanHz, lensOn, focusHz]);
+  const uniforms = useMemo(() => (scale ? lensUniforms(scale) : null), [scale]);
+  const uniformsRef = useRef(uniforms);
+  // A hover line placed on the old scale would point at the wrong frequency.
+  useEffect(() => setHover(null), [scale]);
+  useEffect(() => {
+    uniformsRef.current = uniforms;
+    renderer.current?.setLens(uniforms);
+    redraw.current();
+  }, [uniforms]);
+
+  useFineSpectrum(lensOn ? iqChannelId ?? null : null, lensOn, (batch) => {
+    const r = renderer.current;
+    setFineLive(!!batch);
+    if (!r) return;
+    if (!batch || low === null || !meta.spanHz) {
+      r.setFine(null);
+    } else {
+      r.setFine({ center: (batch.centerHz - low) / meta.spanHz, width: batch.rateHz / meta.spanHz, reach: LENS_CORE_HZ / meta.spanHz, bins: batch.bins });
+      batch.rows.forEach((row) => r.pushFine(row.sequence, row.bins));
+    }
+    redraw.current();
+  });
 
   useEffect(() => {
     const el = canvas.current;
@@ -47,9 +87,12 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     } catch {
       return;
     }
-    spectrumRows.slice(-visible).forEach((row) => r.push(row.bins));
+    spectrumRows.slice(-visible).forEach((row) => r.push(row.bins, row.sequence));
+    r.setLens(uniformsRef.current);
+    renderer.current = r;
     let frame = 0;
     let dirty = true;
+    redraw.current = () => { dirty = true; };
     const draw = () => {
       if (dirty) {
         r.draw();
@@ -69,7 +112,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     const observer = new ResizeObserver(resize);
     observer.observe(el);
     const unsubscribe = onSpectrumRows((rows) => {
-      rows.forEach((row) => r.push(row.bins));
+      rows.forEach((row) => r.push(row.bins, row.sequence));
       dirty = true;
     });
     frame = requestAnimationFrame(draw);
@@ -86,13 +129,14 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       unsubscribe();
       el.removeEventListener("webglcontextlost", lost);
       el.removeEventListener("webglcontextrestored", restored);
+      if (renderer.current === r) renderer.current = null;
+      redraw.current = () => {};
       r.dispose();
     };
   }, [meta.bins, meta.epoch, visible, contextEpoch]);
 
-  const low = meta.centerHz !== null && meta.spanHz !== null ? meta.centerHz - meta.spanHz / 2 : null;
   const markers = useMemo(() => {
-    if (low === null || !meta.spanHz) return [];
+    if (!scale) return [];
     // Both TDMA slots and raw/unknown aliases occupy the same RF trace.
     const unique = new Map<number, Source>();
     const rank = (s: Source) => Number(s.id === activeSourceId) * 8 + Number(talking.has(s.id)) * 4 + Number(s.named) * 2 + Number(s.heardVoice);
@@ -103,24 +147,32 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       if (!existing || rank(source) > rank(existing)) unique.set(hz, source);
     }
     return [...unique.values()]
-      .map((s) => ({ source: s, x: (s.frequencyHz! - low) / meta.spanHz!, live: talking.has(s.id) }))
+      .map((s) => ({ source: s, x: scale.x(s.frequencyHz!), live: talking.has(s.id) }))
       .filter((m) => m.x >= 0 && m.x <= 1);
-  }, [sources, talking, low, meta.spanHz, activeSourceId]);
+  }, [sources, talking, scale, activeSourceId]);
 
-  const frequencyAt = (clientX: number) => {
+  const positionAt = (clientX: number) => {
     const rect = box.current?.getBoundingClientRect();
-    if (!rect || low === null || !meta.spanHz) return null;
-    return low + Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) * meta.spanHz;
+    return rect ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : null;
+  };
+  const frequencyAt = (clientX: number) => {
+    const x = positionAt(clientX);
+    if (x === null || !scale) return null;
+    // Under a lens the side past the nearer window edge is blank: pick its edge.
+    return Math.max(scale.lowHz, Math.min(scale.lowHz + scale.spanHz, scale.hz(x)));
   };
 
   const interactive = variant === "full" && (!!onListen || !!onUnnamed);
   const targetAt = (clientX: number, clientY: number, exact: boolean) => {
     const rect = box.current?.getBoundingClientRect();
     const frequency = frequencyAt(clientX);
-    if (!rect || frequency === null || low === null || !meta.spanHz) return null;
+    const x = positionAt(clientX);
+    if (!rect || frequency === null || x === null || !scale || low === null || !meta.spanHz) return null;
     const row = Math.floor(Math.max(0, Math.min(0.999, (clientY - rect.top) / rect.height)) * visible);
-    const bins = spectrumRows[spectrumRows.length - 1 - row]?.bins;
-    return pickSignal(frequency, HIT_PX / rect.width * meta.spanHz, low, meta.spanHz, bins, sources, exact);
+    // Inside the lens core one wideband bin covers the whole core, so don't snap to its peak.
+    const inCore = scale.lens !== null && Math.abs(frequency - scale.lens.focusHz) <= scale.lens.coreHz;
+    const bins = inCore ? undefined : spectrumRows[spectrumRows.length - 1 - row]?.bins;
+    return pickSignal(frequency, HIT_PX / rect.width * scale.hzPerWidth(x), low, meta.spanHz, bins, sources, exact);
   };
   const pick = (clientX: number, clientY: number, exact: boolean) => {
     const target = targetAt(clientX, clientY, exact);
@@ -139,7 +191,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
   const magnitude = 10 ** Math.floor(Math.log10(rawStep));
   const tickStep = [1, 2, 5, 10].find((n) => n * magnitude >= rawStep)! * magnitude;
   const frequencyTicks: number[] = [];
-  if (low !== null && meta.spanHz) {
+  if (low !== null && meta.spanHz && !scale?.lens) {
     for (let hz = Math.ceil(low / tickStep) * tickStep; hz <= low + meta.spanHz; hz += tickStep)
       frequencyTicks.push(hz);
   }
@@ -155,6 +207,17 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
               <span className="absolute bottom-2 -translate-x-1/2 whitespace-nowrap">{(hz / 1e6).toFixed(Math.max(0, Math.ceil(6 - Math.log10(tickStep))))}</span>
             </span>
           ))}
+          {scale?.lens && lensTicks(scale, width).map((tick) => (
+            <span key={tick.x} className={cn("absolute bottom-0 border-l", tick.major ? "h-2 border-[#93a1b8]/80" : "h-1 border-[#93a1b8]/50")} style={{ left: `${tick.x * 100}%` }}>
+              {tick.label && <span className="absolute bottom-2 -translate-x-1/2 whitespace-nowrap">{tick.label}</span>}
+            </span>
+          ))}
+          {scale?.lens && (
+            <span className="tabular absolute bottom-2 left-1/2 -translate-x-1/2 bg-[#0f1a2b] px-1 text-[#f2f5fa]">{(scale.lens.focusHz / 1e6).toFixed(4)}</span>
+          )}
+          <button type="button" aria-pressed={lensOn} title="Lens: ±20 kHz around the tuned frequency, log scale beyond"
+            className={cn("absolute top-0 left-1 rounded px-1.5 leading-5", lensOn ? "bg-[#5eb8c9] text-[#0f1a2b]" : "bg-[#0f1a2b] text-[#c9d4e5] hover:bg-white/10")}
+            onClick={() => prefs.set("lens", !lensOn)}>Lens</button>
           <span className="absolute top-0 right-1 bg-[#0f1a2b] px-1">MHz</span>
         </div>
       )}
@@ -174,7 +237,8 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       } : undefined}
       onPointerMove={interactive ? (e) => {
         setHover(targetAt(e.clientX, e.clientY, e.shiftKey));
-        if (drag.current?.pointerId === e.pointerId && performance.now() - drag.current.lastTune >= 120)
+        // Under the lens the scale re-centres on each tune, so dragging would chase itself.
+        if (!lensOn && drag.current?.pointerId === e.pointerId && performance.now() - drag.current.lastTune >= 120)
           pick(e.clientX, e.clientY, e.shiftKey);
       } : undefined}
       onPointerUp={interactive ? (e) => {
@@ -201,7 +265,9 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
         </span>
       ))}
       {variant === "full" && meta.bins > 0 && meta.spanHz && (
-        <span className="pointer-events-none absolute bottom-1 right-1 rounded bg-[#0f1a2b]/85 px-1 text-[10px] text-[#c9d4e5]">{(meta.spanHz / meta.bins / 1000).toFixed(2)} kHz/bin</span>
+        <span className="pointer-events-none absolute bottom-1 right-1 rounded bg-[#0f1a2b]/85 px-1 text-[10px] text-[#c9d4e5]">{lensOn
+          ? fineLive ? "Lens ±20 kHz · 98 Hz bins" : `Lens ±20 kHz · ${(meta.spanHz / meta.bins / 1000).toFixed(0)} kHz bins (listen for detail)`
+          : `${(meta.spanHz / meta.bins / 1000).toFixed(2)} kHz/bin`}</span>
       )}
       {empty && (
         <p className="absolute inset-0 grid place-items-center px-4 text-center text-xs text-[#93a1b8]">
@@ -226,16 +292,15 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
             style={{ left: `${x * 100}%` }}
           />
         ))}
-      {captureRange && low !== null && meta.spanHz && (
+      {captureRange && scale && (
         <span aria-hidden data-iq-range className="pointer-events-none absolute inset-y-0 border-x border-[#5eb8c9]/90 bg-[#5eb8c9]/15"
-          style={{ left: `${Math.max(0, (captureRange.centerHz - captureRange.spanHz / 2 - low) / meta.spanHz) * 100}%`,
-            width: `${Math.max(0, Math.min(low + meta.spanHz, captureRange.centerHz + captureRange.spanHz / 2) - Math.max(low, captureRange.centerHz - captureRange.spanHz / 2)) / meta.spanHz * 100}%` }} />
+          style={captureStyle(captureRange, scale!)} />
       )}
       {variant === "full" && tunedFrequencyHz != null && low !== null && meta.spanHz && tunedFrequencyHz >= low && tunedFrequencyHz <= low + meta.spanHz && (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-0.5 bg-[#5eb8c9]" style={{ left: `${(tunedFrequencyHz - low) / meta.spanHz * 100}%` }} />
+        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-0.5 bg-[#5eb8c9]" style={{ left: `${scale!.x(tunedFrequencyHz) * 100}%` }} />
       )}
       {variant === "full" && hover !== null && low !== null && meta.spanHz && (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-px bg-white/70" style={{ left: `${(hover.frequencyHz - low) / meta.spanHz * 100}%` }} />
+        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-px bg-white/70" style={{ left: `${scale!.x(hover.frequencyHz) * 100}%` }} />
       )}
       {variant === "full" && hover !== null && (
         <span className="tabular pointer-events-none absolute bottom-2 left-2 rounded bg-[#0f1a2b]/85 px-1.5 py-0.5 text-xs text-[#f2f5fa]">
@@ -245,4 +310,13 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     </div>
     </div>
   );
+}
+
+/** The capture range's band on screen, clipped to the window (and to the screen under a lens). */
+function captureStyle(range: { centerHz: number; spanHz: number }, scale: { lowHz: number; spanHz: number; x(hz: number): number }) {
+  const lo = Math.max(scale.lowHz, range.centerHz - range.spanHz / 2);
+  const hi = Math.min(scale.lowHz + scale.spanHz, range.centerHz + range.spanHz / 2);
+  const left = Math.max(0, Math.min(1, scale.x(lo)));
+  const right = Math.max(0, Math.min(1, scale.x(hi)));
+  return { left: `${left * 100}%`, width: `${Math.max(0, right - left) * 100}%` };
 }

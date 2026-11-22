@@ -122,6 +122,47 @@ async fn iq_status(State(app): State<App>, Path(id): Path<String>) -> ApiResult 
         && status["last_received_at"].as_f64().is_some_and(|last| now - last < 2.));
     Ok(Json(status))
 }
+/// Fine spectrum of a listened channel's IQ slice for the waterfall lens, FSP1: one row
+/// per waterfall row (same sequence) with IQ behind it. 40-byte little-endian header:
+/// magic `FSP1`, bins u16, rows u16, center_hz f64 (true, the slice's physical center),
+/// rate_hz f64 (true; the rows span center ± rate/2, lowest frequency first), low_db f32
+/// (level 1), high_db f32 (level 255), latest waterfall sequence u64. Then per row: seq
+/// u64, bins x u8. Level 0 is never sent. Rows with seq > `after`, oldest first.
+async fn iq_spectrum_bin(State(app): State<App>, Path(id): Path<String>, Query(q): Query<After>) -> axum::response::Response {
+    let snapshot = match iq_snapshot(&app, &id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return api_error(StatusCode::GONE, "No IQ buffered yet; start listening to this channel first").into_response(),
+        Err(e) => return e.into_response(),
+    };
+    let (moments, latest) = {
+        let e = app.engine();
+        // One moment before `after` too: it sets the spacing of the first new row.
+        let first = e.psd_host.iter().position(|(n, _)| *n > q.after).unwrap_or(e.psd_host.len());
+        (e.psd_host.iter().skip(first.saturating_sub(1)).copied().collect::<Vec<_>>(), e.psd_seq)
+    };
+    let cal = app.calibration;
+    let built = tokio::task::spawn_blocking(move || {
+        let rows: Vec<_> = snapshot.fine_rows(&moments).into_iter().filter(|(n, _)| *n > q.after).collect();
+        let mut out = Vec::with_capacity(40 + rows.len() * (8 + crate::iq::FINE_BINS));
+        out.extend_from_slice(b"FSP1");
+        out.extend_from_slice(&(crate::iq::FINE_BINS as u16).to_le_bytes());
+        out.extend_from_slice(&(rows.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cal.true_hz(snapshot.center_reading_hz()).to_le_bytes());
+        out.extend_from_slice(&cal.true_hz(snapshot.rate()).to_le_bytes());
+        out.extend_from_slice(&crate::iq::FINE_LOW_DB.to_le_bytes());
+        out.extend_from_slice(&crate::iq::FINE_HIGH_DB.to_le_bytes());
+        out.extend_from_slice(&latest.to_le_bytes());
+        for (seq, row) in rows {
+            out.extend_from_slice(&seq.to_le_bytes());
+            out.extend_from_slice(&row);
+        }
+        out
+    }).await;
+    match built {
+        Ok(out) => ([(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"))], out).into_response(),
+        Err(_) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "fine spectrum failed").into_response(),
+    }
+}
 static IQ_EXPORT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 async fn iq_download(State(app): State<App>, Path(id): Path<String>) -> axum::response::Response {
     let permit = match IQ_EXPORT.try_acquire() {
@@ -926,6 +967,7 @@ pub fn router(app: App, web_dir: Option<PathBuf>) -> Router {
         .route("/api/tune", post(tune))
         .route("/api/iq/{id}", get(iq_status))
         .route("/api/iq/{id}/capture.sigmf", get(iq_download))
+        .route("/api/iq/{id}/spectrum.bin", get(iq_spectrum_bin))
         .route("/api/stop", post(stop))
         .route("/api/receiver", post(receiver_control))
         .route("/api/source", post(configure_source))

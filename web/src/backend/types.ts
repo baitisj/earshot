@@ -38,6 +38,20 @@ export interface IqCaptureStatus {
   last_received_at: number | null;
 }
 
+/** Fine spectrum of a listened channel's IQ slice (FSP1), one row per waterfall row. */
+export interface FineSpectrum {
+  /** True physical center of the slice and its sample rate: rows span center ± rate/2. */
+  centerHz: number;
+  rateHz: number;
+  lowDb: number;
+  highDb: number;
+  /** Newest waterfall sequence the engine had. */
+  sequence: number;
+  bins: number;
+  /** Levels 1..255 from lowDb to highDb, lowest frequency first, matched by waterfall sequence. */
+  rows: { sequence: number; bins: Uint8Array }[];
+}
+
 /** Feature endpoints from engine/README.md § "Frontend needs". */
 export type Need = "blocks" | "catalog" | "calls" | "activity" | "spectrumBinary";
 
@@ -61,6 +75,8 @@ export interface Backend {
   captureUrl?(channelId: string, seconds: number): string;
   iqCaptureStatus?(channelId: string): Promise<IqCaptureStatus | null>;
   downloadIq?(channelId: string): Promise<Blob>;
+  /** Fine rows for waterfall rows after `after`; null when the channel holds no IQ (not listened). */
+  fineSpectrum?(channelId: string, after: number): Promise<FineSpectrum | null>;
   /** Operator: stop the receiver (not just the listener). */
   stopReceiver(): Promise<string>;
   /** Persist desired receiving state through the supervisor; samples/restoration confirm it. */

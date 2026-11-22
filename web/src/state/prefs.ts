@@ -11,6 +11,8 @@ export interface Prefs {
   alertBusy: boolean;
   theme: ThemeChoice;
   volume: number;
+  /** Waterfall lens: ±20 kHz around the tuned frequency, log scale beyond. */
+  lens: boolean;
 }
 
 const KEY = "radio.prefs.v1";
@@ -21,6 +23,7 @@ const defaults: Prefs = {
   alertBusy: false,
   theme: "dark",
   volume: 0.8,
+  lens: false,
 };
 
 const ids = z.array(z.string());
@@ -32,6 +35,7 @@ const prefsSchema = z.object({
   alertBusy: z.boolean().catch(defaults.alertBusy),
   theme: z.enum(["dark", "light", "system"]).catch(defaults.theme),
   volume: z.number().min(0).max(1).catch(defaults.volume),
+  lens: z.boolean().catch(defaults.lens),
 });
 
 export const prefsStore = createStore<Prefs>(local.read(KEY, prefsSchema, defaults));

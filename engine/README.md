@@ -164,6 +164,13 @@ it. Nothing is retained for spectrum-only activity before a listener selects the
 `GET /api/iq/{channel_id}` reports samples, seconds, rate, center and whether samples are
 currently arriving; `GET /api/iq/{channel_id}/capture.sigmf` downloads the snapshot.
 An empty buffer returns 410; archive preparation is serialized with 429 on concurrent requests.
+`GET /api/iq/{channel_id}/spectrum.bin?after=N` returns FSP1: a 1024-point (97.7 Hz at
+100 kS/s) Hann-windowed spectrum of that slice for each waterfall row with sequence > N, cut
+from the IQ that arrived since the previous row, so each fine row matches a waterfall row.
+Header (40 bytes, little-endian): `FSP1`, bins u16, rows u16, center_hz f64 and rate_hz f64
+(true; rows run from center − rate/2 upward), low_db f32 (level 1), high_db f32 (level 255),
+newest waterfall sequence u64; then per row a sequence u64 and the levels. Level 0 is never
+sent. The web app's waterfall lens draws these inside its ±20 kHz core.
 
 Click or drag the full waterfall to listen. Dragging updates the marker immediately and
 submits changed targets at most once per 120 ms, with a final selection on release. The

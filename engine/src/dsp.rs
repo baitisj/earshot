@@ -229,7 +229,7 @@ impl ChannelDsp {
     }
 }
 /// In-place radix-2 FFT; `data.len()` must be a power of two.
-fn fft(data: &mut [Complex32]) {
+pub(crate) fn fft(data: &mut [Complex32]) {
     let n = data.len();
     assert!(n.is_power_of_two());
     let mut j = 0;

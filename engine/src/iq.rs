@@ -1,10 +1,15 @@
 //! Bounded, pre-demodulation snapshots of the physical IQ slices listeners pin.
-use crate::{freq::Calibration, wire::{Frame, DISCONTINUITY, OVERFLOW, PREROLL, START}};
+use crate::{dsp::fft, freq::Calibration, wire::{Frame, DISCONTINUITY, OVERFLOW, PREROLL, START}};
 use serde_json::{json, Value};
+use num_complex::Complex32;
 use std::{collections::{HashMap, VecDeque}, io, sync::Arc};
 
 const MAX_BYTES: usize = 32 * 1024 * 1024;
 const SECONDS: f64 = 30.;
+/// Fine spectrum size: 1024 points at 100 ksps is 97.7 Hz per bin.
+pub const FINE_BINS: usize = 1024;
+pub const FINE_LOW_DB: f32 = -160.;
+pub const FINE_HIGH_DB: f32 = 0.;
 
 #[derive(Clone)]
 struct Packet { frame: Arc<Frame>, received: f64 }
@@ -58,6 +63,71 @@ impl IqHistory {
 
 pub(crate) struct IqSnapshot { packets: Vec<Packet>, rate: f64 }
 impl IqSnapshot {
+    /// Fine spectrum of this slice at the given moments (PSD sequence, host arrival time),
+    /// for the waterfall's lens: one row per moment that has IQ received within 0.5 s
+    /// before it. Each row averages Hann-windowed `FINE_BINS`-point FFTs (50 % overlap)
+    /// over the IQ that arrived since the previous moment (at most 8 windows), lowest
+    /// frequency first, dB relative to a full-scale complex tone, quantized from
+    /// `FINE_LOW_DB` (1) to `FINE_HIGH_DB` (255). Level 0 never occurs, so a client can
+    /// use it for "no fine data". The first moment only sets the spacing of the next.
+    pub fn fine_rows(&self, moments: &[(u64, f64)]) -> Vec<(u64, Vec<u8>)> {
+        const N: usize = FINE_BINS;
+        let mut ends = Vec::with_capacity(self.packets.len());
+        let mut total = 0usize;
+        for p in &self.packets {
+            total += p.frame.payload.len() / 4;
+            ends.push((p.received, total));
+        }
+        let full_scale = 2f32.powi(self.packets.first().map_or(15, |p| p.frame.valid_bits.clamp(2, 16) as i32 - 1));
+        let window: Vec<f32> = (0..N).map(|i| 0.5 - 0.5 * (2. * std::f32::consts::PI * i as f32 / N as f32).cos()).collect();
+        let gain: f32 = window.iter().sum::<f32>() * full_scale;
+        let mut rows = vec![];
+        for pair in moments.windows(2) {
+            let ((_, before), (seq, at)) = (pair[0], pair[1]);
+            let last = ends.partition_point(|(received, _)| *received <= at);
+            if last == 0 || at - ends[last - 1].0 > 0.5 { continue; }
+            let end = ends[last - 1].1;
+            let wanted = (((at - before).max(0.) * self.rate) as usize).clamp(N, 8 * N);
+            let windows = 1 + (wanted - N) / (N / 2);
+            let span = N + (windows - 1) * (N / 2);
+            if end < span { continue; }
+            let samples = self.samples_between(end - span, end);
+            let mut power = vec![0f32; N];
+            let mut buffer = vec![Complex32::new(0., 0.); N];
+            for w in 0..windows {
+                let segment = &samples[w * N / 2..w * N / 2 + N];
+                for ((b, x), h) in buffer.iter_mut().zip(segment).zip(&window) { *b = x * *h; }
+                fft(&mut buffer);
+                for (p, b) in power.iter_mut().zip(&buffer) { *p += b.norm_sqr(); }
+            }
+            let scale = 1. / (windows as f32 * gain * gain);
+            let row = (0..N).map(|k| {
+                let db = 10. * (power[(k + N / 2) % N] * scale).max(1e-30).log10();
+                (1. + 254. * (db - FINE_LOW_DB) / (FINE_HIGH_DB - FINE_LOW_DB)).round().clamp(1., 255.) as u8
+            }).collect();
+            rows.push((seq, row));
+        }
+        rows
+    }
+    /// Samples `[from, to)` counted from the first retained one, as full-scale-free floats.
+    fn samples_between(&self, from: usize, to: usize) -> Vec<Complex32> {
+        let mut out = Vec::with_capacity(to - from);
+        let mut at = 0usize;
+        for p in &self.packets {
+            let count = p.frame.payload.len() / 4;
+            if at + count > from && at < to {
+                let skip = from.saturating_sub(at);
+                let take = (to - at).min(count) - skip;
+                out.extend(p.frame.payload[skip * 4..(skip + take) * 4].chunks_exact(4).map(|b|
+                    Complex32::new(i16::from_le_bytes([b[0], b[1]]) as f32, i16::from_le_bytes([b[2], b[3]]) as f32)));
+            }
+            at += count;
+            if at >= to { break; }
+        }
+        out
+    }
+    pub fn rate(&self) -> f64 { self.rate }
+    pub fn center_reading_hz(&self) -> f64 { self.packets[0].frame.center_hz as f64 }
     fn samples(&self) -> usize { self.packets.iter().map(|p| p.frame.payload.len() / 4).sum() }
     pub fn status(&self, cal: Calibration) -> Value {
         let first = &self.packets[0].frame;
@@ -135,6 +205,33 @@ mod tests {
         assert_eq!(meta["captures"][1]["core:sample_start"], 2);
         assert_eq!(meta["captures"][1]["core:global_index"], 105);
         assert_eq!(meta["annotations"][0]["core:label"], "discontinuity");
+    }
+    #[test]
+    fn fine_rows_put_a_tone_in_its_bin_and_skip_moments_without_iq() {
+        let mut h = IqHistory::default();
+        let rate = 100000.;
+        let tone = 10_000.;
+        let mut sample = 0u64;
+        for packet in 0..40u64 {
+            let payload: Vec<u8> = (0..1000).flat_map(|i| {
+                let phase = 2. * std::f64::consts::PI * tone * (sample + i) as f64 / rate;
+                let (q, i_) = ((8000. * phase.sin()) as i16, (8000. * phase.cos()) as i16);
+                [i_.to_le_bytes(), q.to_le_bytes()].concat()
+            }).collect();
+            h.push(Arc::new(Frame { kind:1,flags:0,generation:1,stream_id:7,sequence:packet,first_sample:sample,
+                rate:100000,center_hz:454000000,format:1,valid_bits:16,payload }), rate, 100. + packet as f64 * 0.01);
+            sample += 1000;
+        }
+        let rows = h.snapshot(7).unwrap().fine_rows(&[(1, 100.2), (2, 100.3), (3, 100.39), (4, 101.5)]);
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), [2, 3], "moment 4 has no IQ within 0.5 s");
+        let row = &rows[0].1;
+        let peak = (0..FINE_BINS).max_by_key(|&k| row[k]).unwrap();
+        let expected = FINE_BINS / 2 + (tone / (rate / FINE_BINS as f64)).round() as usize;
+        assert!(peak.abs_diff(expected) <= 1, "peak {peak} expected {expected}");
+        // 8000 of 32768 full scale is -12.2 dB.
+        let db = FINE_LOW_DB + (row[peak] as f32 - 1.) / 254. * (FINE_HIGH_DB - FINE_LOW_DB);
+        assert!((db + 12.2).abs() < 2., "tone level {db} dB");
+        assert!(row.iter().all(|&v| v >= 1));
     }
     #[test]
     fn reset_overlap_and_preroll_cannot_mix_iq_epochs() {
