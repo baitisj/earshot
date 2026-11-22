@@ -4,10 +4,12 @@ set -eu
 engine_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 native_root="$engine_root/.native"
 mkdir -p "$native_root/src" "$native_root/lib"
-for dependency in dsdcc mbelib; do
+for dependency in dsdcc mbelib hamflac opus; do
     case "$dependency" in
         dsdcc) repository=https://github.com/f4exb/dsdcc; revision=f27b32d2df131ae3a376fe72d3fb880ae1f9ede1;;
         mbelib) repository=https://github.com/szechyjs/mbelib; revision=9a04ed5c78176a9965f3d43f7aa1b1f5330e771f;;
+        hamflac) repository=https://github.com/baitisj/hamflac; revision=6a6e7088b1c9eac61c6778b65451e1f8967437aa;;
+        opus) repository=https://github.com/xiph/opus; revision=ddbe48383984d56acd9e1ab6a090c54ca6b735a6;;
     esac
     source_dir="$native_root/src/$dependency"
     if [ ! -d "$source_dir/.git" ]; then
@@ -28,4 +30,8 @@ case "$(uname -s)" in Darwin) mbe_library="$native_root/lib/libmbe.dylib";; *) m
 cmake -S "$native_root/src/dsdcc" -B "$native_root/build-dsdcc" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$native_root" -DUSE_MBELIB=ON -DBUILD_TOOL=OFF -DLIBMBE_INCLUDE_DIR="$native_root/include" -DLIBMBE_LIBRARY="$mbe_library"
 cmake --build "$native_root/build-dsdcc" --parallel 4
 cmake --install "$native_root/build-dsdcc"
+# libopus for live browser audio, static. HamFLAC is compiled by build.rs from its pinned source.
+cmake -S "$native_root/src/opus" -B "$native_root/build-opus" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$native_root" -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DOPUS_BUILD_PROGRAMS=OFF -DBUILD_TESTING=OFF
+cmake --build "$native_root/build-opus" --parallel 4
+cmake --install "$native_root/build-opus"
 printf '%s\n' 'Native codecs built. Run cargo build --release --locked from engine/.'

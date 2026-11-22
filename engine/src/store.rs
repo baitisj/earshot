@@ -35,6 +35,15 @@ pub const ACTIVITY_KEEP_S: u64 = 14 * 86400;
 pub const MAX_USER_ENTRIES: usize = 5000;
 
 /// Mono signed16 PCM at 8 kHz in a canonical 44-byte-header WAV.
+/// The samples of a WAV written by `wav_bytes`.
+pub fn wav_samples(wav: &[u8]) -> Option<Vec<i16>> {
+    if wav.get(..4)? != b"RIFF" || wav.get(36..40)? != b"data" {
+        return None;
+    }
+    let length = u32::from_le_bytes(wav.get(40..44)?.try_into().ok()?) as usize;
+    let data = wav.get(44..44 + length)?;
+    Some(data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect())
+}
 pub fn wav_bytes(samples: &[i16]) -> Vec<u8> {
     let data = samples.len() * 2;
     let mut out = Vec::with_capacity(44 + data);
@@ -181,7 +190,7 @@ impl OpenCall {
             "duration_s": duration,
             "level_db": level,
             "audio_url": audio_url,
-            "audio_format": "audio/wav; 8 kHz mono signed16",
+            "audio_format": "audio/flac; 8 kHz mono 16-bit",
             "talker": null,
             "transcript": null,
             "encrypted": false,
@@ -453,7 +462,7 @@ impl Store {
         let duration = open.samples.len() as f64 / AUDIO_RATE as f64;
         let id = open.id?; // never reached MIN_CALL_S: discarded without a trace
         let level = (open.level_n > 0).then(|| open.level_sum / open.level_n as f64);
-        let url = Some(format!("/api/calls/{id}/audio.wav"));
+        let url = Some(format!("/api/calls/{id}/audio.flac"));
         let meta = open.wire(id, Some(open.last_audio), url, duration, level);
         if let (Some(io), Some(dir)) = (&self.io, &self.dir) {
             io.write(

@@ -1,6 +1,8 @@
 use std::{env, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=native/decoder.cpp");
+    println!("cargo:rerun-if-changed=native/flac.cpp");
+    println!("cargo:rerun-if-changed=.native/lib/libopus.a");
     println!("cargo:rerun-if-changed=.native/lib/libdsdcc.1.dylib");
     println!("cargo:rerun-if-changed=.native/lib/libdsdcc.so");
     println!("cargo:rerun-if-changed=.native/src/dsdcc/dsd_mbe.h");
@@ -40,6 +42,24 @@ fn main() {
         .include(include)
         .file("native/decoder.cpp")
         .compile("radio_codec");
+    // HamFLAC (saved audio) and libopus (live audio) come pinned from bootstrap-codecs.sh.
+    let native = root.join(".native");
+    let hamflac = native.join("src/hamflac");
+    assert!(hamflac.join("src/hamflac.cpp").is_file(), "HamFLAC source missing; run scripts/bootstrap-codecs.sh");
+    assert!(native.join("lib/libopus.a").is_file(), "libopus missing; run scripts/bootstrap-codecs.sh");
+    cc::Build::new()
+        .cpp(true)
+        .std("c++20")
+        .warnings(false)
+        .include(hamflac.join("include"))
+        .include(hamflac.join("src"))
+        .include(hamflac.join("third_party/dr_libs"))
+        .file("native/flac.cpp")
+        .file(hamflac.join("src/hamflac.cpp"))
+        .compile("earshot_flac");
+    println!("cargo:rustc-link-search=native={}", native.join("lib").canonicalize().unwrap().display());
+    println!("cargo:rustc-link-lib=static=opus");
+    println!("cargo:rustc-link-lib=m");
     let link_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let link = link_dir.join(if cfg!(target_os = "macos") {
         "libdsdcc.dylib"

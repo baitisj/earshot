@@ -1,5 +1,6 @@
 import { RawCapture } from "./capture";
-import { engineChannelSchema } from "@/api/engine";
+import { OpusStream, opusPlayable } from "./opus";
+import { engineChannelSchema, type AudioDescriptor, type OpusDescriptor } from "@/api/engine";
 import { toSources } from "@/domain/adapt";
 import workletUrl from "./pcm-worklet.ts?worker&url";
 import { BackendError, type Backend, type Connection } from "@/backend/types";
@@ -69,6 +70,8 @@ const idle = {
 const SETTLE_MS = 1500;
 /** No audio or heartbeat for this long means the socket is dead even if it looks open. */
 const SILENT_SOCKET_MS = 3000;
+/** The engine keeps this much raw audio per channel. */
+const CAPTURE_MAX_S = 120;
 
 function monitorMessage(error: unknown): string {
   if (error instanceof BackendError) {
@@ -98,6 +101,11 @@ export class Player {
   });
   private backend: Backend;
   private capture: RawCapture | null = null;
+  /** Raw audio heard as Opus: the engine holds the lossless copy, this counts how much. */
+  private engineCaptureSeconds = 0;
+  /** Decided once, on the first listen. A decoder failure turns it off for this page. */
+  private useOpus: boolean | null = null;
+  private opus: OpusStream | null = null;
   private context: AudioContext | null = null;
   private node: AudioWorkletNode | null = null;
   private gain: GainNode | null = null;
@@ -265,7 +273,22 @@ export class Player {
   }
 
   private flush() {
+    this.opus?.reset();
     this.node?.port.postMessage({ type: "flush" });
+  }
+
+  private playPcm(data: Float32Array<ArrayBuffer>, rate: number) {
+    this.node?.port.postMessage({ type: "pcm", data, rate }, [data.buffer]);
+  }
+
+  /** This browser can't decode the stream after all: reconnect for plain PCM. */
+  private opusFailed() {
+    this.useOpus = false;
+    this.opus?.reset();
+    this.opus = null;
+    if (this.state.get().kind !== "live") return;
+    this.dropSocket();
+    this.scheduleReconnect();
   }
 
   // ---------------------------------------------------------------- selection
@@ -305,6 +328,7 @@ export class Player {
     const intent = ++this.intent;
     let channelId = raw ? null : source.channelIds[0] ?? null;
     this.capture = raw && !ssb && source.frequencyHz !== null ? new RawCapture(source.frequencyHz) : null;
+    this.engineCaptureSeconds = 0;
     this.lastSource = source;
     this.lastRaw = raw;
     this.lastSsb = ssb;
@@ -318,6 +342,7 @@ export class Player {
         this.patch({ phase: "error", error: "Audio didn't start. Tap to retry." });
       return;
     }
+    this.useOpus ??= await opusPlayable();
     if (intent !== this.intent) return;
     this.selectionPending = true;
     try {
@@ -406,30 +431,53 @@ export class Player {
 
   // ---------------------------------------------------------------- socket
 
+  /** Whether audio with this descriptor belongs to what we're playing now. */
+  private admit(descriptor: AudioDescriptor | OpusDescriptor) {
+    const s = this.state.get();
+    if (s.kind !== "live" || descriptor.channel_id !== s.channelId || s.phase === "taken" || s.phase === "error") return false;
+    if (this.decoderGeneration !== descriptor.generation) {
+      this.flush();
+      this.decoderGeneration = descriptor.generation;
+    }
+    return true;
+  }
+
+  private audioArrived() {
+    this.lastAudio = performance.now();
+    this.reconnectAttempt = 0;
+    if (this.state.get().phase !== "playing") this.patch({ phase: "playing", takenBy: null });
+  }
+
   private openSocket() {
     if (this.connection) return;
     const token = ++this.connectionToken;
     this.lastMessage = performance.now();
+    const opus = this.useOpus === true;
     this.connection = this.backend.listen({
       onAudio: (descriptor, pcm) => {
         if (token !== this.connectionToken) return;
         this.lastMessage = performance.now();
-        const s = this.state.get();
-        if (s.kind !== "live" || descriptor.channel_id !== s.channelId || s.phase === "taken" || s.phase === "error" || pcm.length === 0) return;
-        if (this.decoderGeneration !== descriptor.generation) {
-          this.flush();
-          this.decoderGeneration = descriptor.generation;
-        }
-        if (s.raw && descriptor.raw === true && descriptor.rate_hz === 48000) {
+        if (pcm.length === 0 || !this.admit(descriptor)) return;
+        if (this.state.get().raw && descriptor.raw === true && descriptor.rate_hz === 48000) {
           this.capture?.push(descriptor, pcm);
           this.patch({ captureSeconds: this.capture?.seconds ?? 0 });
         }
         const data = new Float32Array(pcm.length);
         for (let i = 0; i < pcm.length; i++) data[i] = pcm[i] / 32768;
-        this.node?.port.postMessage({ type: "pcm", data, rate: descriptor.rate_hz }, [data.buffer]);
-        this.lastAudio = performance.now();
-        this.reconnectAttempt = 0;
-        if (s.phase !== "playing") this.patch({ phase: "playing", takenBy: null });
+        this.playPcm(data, descriptor.rate_hz);
+        this.audioArrived();
+      },
+      onOpus: (descriptor, packets) => {
+        if (token !== this.connectionToken) return;
+        this.lastMessage = performance.now();
+        if (!this.admit(descriptor)) return;
+        if (this.capture && this.state.get().raw && descriptor.raw && descriptor.rate_hz === 48000) {
+          this.engineCaptureSeconds = Math.min(CAPTURE_MAX_S, this.engineCaptureSeconds + packets.length * (descriptor.frame_ms / 1000));
+          this.patch({ captureSeconds: this.engineCaptureSeconds });
+        }
+        this.opus ??= new OpusStream((data, rate) => this.playPcm(data, rate), () => this.opusFailed());
+        this.opus.decode(packets);
+        this.audioArrived();
       },
       onHeartbeat: (selected) => {
         if (token !== this.connectionToken) return;
@@ -446,7 +494,7 @@ export class Player {
         this.capture?.gap("socket closed");
         this.scheduleReconnect();
       },
-    });
+    }, { opus });
   }
 
   private dropSocket() {
@@ -508,7 +556,7 @@ export class Player {
     this.ownsSelection = false;
     this.selectionPending = false;
     this.teardown();
-    this.patch({ ...idle, captureSeconds: this.capture?.seconds ?? 0,
+    this.patch({ ...idle, captureSeconds: Math.max(this.capture?.seconds ?? 0, this.engineCaptureSeconds),
       frequencyHz: s.frequencyHz, channelId: s.channelId, sourceName: s.sourceName, mode: s.mode, slot: s.slot });
     this.updateSession(null, "");
     this.liveElement?.pause();
@@ -531,6 +579,14 @@ export class Player {
   }
 
   saveCapture() {
+    const channelId = this.state.get().channelId;
+    if (this.capture && this.engineCaptureSeconds > 0 && channelId && this.backend.captureUrl) {
+      const link = document.createElement("a");
+      link.href = this.backend.captureUrl(channelId, Math.ceil(this.engineCaptureSeconds));
+      link.download = `audio_${this.capture.frequencyHz}Hz_raw-fm_${this.capture.startedAt.replace(/[:.]/g, "-")}.flac`;
+      link.click();
+      return;
+    }
     if (!this.capture?.seconds) return;
     const url = URL.createObjectURL(new Blob([this.capture.wav()], { type: "audio/wav" }));
     const link = document.createElement("a");

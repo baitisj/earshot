@@ -100,6 +100,7 @@ pub(crate) struct Audio {
 pub(crate) struct Engine {
     pub(crate) store: Store,
     pub(crate) iq_history: crate::iq::IqHistory,
+    pub(crate) captures: crate::capture::Captures,
     pub(crate) source: Value,
     pub(crate) channels: HashMap<String, Value>,
     /// Operator-selected frequencies in the radio's reading frame. Re-map them to
@@ -153,6 +154,7 @@ impl App {
             inner: Arc::new(Mutex::new(Engine {
                 store: Store::new(state_dir, call_memory_mb),
                 iq_history: crate::iq::IqHistory::default(),
+                captures: crate::capture::Captures::default(),
                 source: json!({}),
                 channels: HashMap::new(),
                 host_targets: HashSet::new(),
@@ -590,6 +592,8 @@ fn worker(app: App, logical: u64, cfg: Value) -> Result<Worker> {
                     for id in raw_targets {
                         // A selection may have changed while the DSP ran.
                         if !wanted_ids(&e).contains(&id) { continue; }
+                        let stream = (e.generation, e.decoder_generation);
+                        e.captures.push(&id, pcm, stream, first_sample, frame.rate);
                         e.audio_sequence += 1;
                         let sequence = e.audio_sequence;
                         let ingress = work.received.elapsed().as_secs_f64() * 1000.;

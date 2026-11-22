@@ -1,10 +1,13 @@
 pub mod ambe;
 pub mod api;
+pub mod capture;
 pub mod codec;
 pub mod dsp;
+pub mod flac;
 pub mod fm;
 pub mod freq;
 pub mod link;
+pub mod opus;
 mod iq;
 pub mod runtime;
 pub mod ssb;

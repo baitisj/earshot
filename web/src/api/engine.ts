@@ -157,7 +157,10 @@ export const engineEventSchema = z.discriminatedUnion("type", [
 ]);
 export type EngineEvent = z.infer<typeof engineEventSchema>;
 
-/** WS /api/listen text messages. A binary PCM message follows each "audio". */
+/**
+ * WS /api/listen text messages. A binary PCM message follows each "audio". With ?codec=opus,
+ * "opus" describes the stream until the next one, and binary messages hold its packets.
+ */
 export const listenMessageSchema = z.discriminatedUnion("type", [
   z.looseObject({
     type: z.literal("audio"),
@@ -170,6 +173,16 @@ export const listenMessageSchema = z.discriminatedUnion("type", [
     source_generation: z.number(),
     sequence: z.number(),
     ingress_age_ms: num,
+  }),
+  z.looseObject({
+    type: z.literal("opus"),
+    channels: z.literal(1),
+    frame_ms: z.literal(20),
+    rate_hz: z.number().int().positive().max(96000),
+    channel_id: z.string(),
+    generation: z.number(),
+    source_generation: z.number(),
+    raw: z.boolean(),
   }),
   z.looseObject({
     type: z.literal("heartbeat"),
@@ -185,6 +198,7 @@ export const listenMessageSchema = z.discriminatedUnion("type", [
 ]);
 export type ListenMessage = z.infer<typeof listenMessageSchema>;
 export type AudioDescriptor = Extract<ListenMessage, { type: "audio" }>;
+export type OpusDescriptor = Extract<ListenMessage, { type: "opus" }>;
 
 export function parseJson<T>(schema: z.ZodType<T>, text: string): T | null {
   try {
