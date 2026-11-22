@@ -6,7 +6,7 @@ import type { Source } from "@/domain/model";
 import { cn } from "@/lib/utils";
 import { createRenderer, type Renderer } from "@/waterfall/renderer";
 import { onSpectrumRows, spectrumRows, useSpectrumMeta } from "@/waterfall/feed";
-import { historyTicks } from "@/waterfall/ticks";
+import { historyTicks, lineTimes, rowForLine, speedGeometry, speedLabel } from "@/waterfall/ticks";
 import { LENS_CORE_HZ, lensScale, lensTicks, lensUniforms, linearScale } from "@/waterfall/lens";
 import { useFineSpectrum } from "@/waterfall/fine";
 import { prefs, usePrefs } from "@/state/prefs";
@@ -41,7 +41,9 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
   const [width, setWidth] = useState(0);
   const [height, setHeight] = useState(0);
   const [hover, setHover] = useState<WaterfallPick | null>(null);
-  const visible = variant === "strip" ? 60 : 300;
+  const speed = usePrefs().waterfallSpeed;
+  // The strip keeps its own fixed pace; the speed slider is the full view's.
+  const { group, lines: visible } = speedGeometry(variant === "full" ? speed : 0, variant === "strip" ? 60 : 300);
   const renderer = useRef<Renderer | null>(null);
   const redraw = useRef(() => {});
   const lensOn = usePrefs().lens && variant === "full";
@@ -83,11 +85,11 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     if (!el || !meta.bins) return;
     let r: Renderer;
     try {
-      r = createRenderer(el, { bins: meta.bins, capacity: 512, visible, smoothing: 1 });
+      r = createRenderer(el, { bins: meta.bins, capacity: 512, visible, smoothing: 1, group });
     } catch {
       return;
     }
-    spectrumRows.slice(-visible).forEach((row) => r.push(row.bins, row.sequence));
+    spectrumRows.slice(-(visible + 1) * group).forEach((row) => r.push(row.bins, row.sequence));
     r.setLens(uniformsRef.current);
     renderer.current = r;
     let frame = 0;
@@ -133,7 +135,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       redraw.current = () => {};
       r.dispose();
     };
-  }, [meta.bins, meta.epoch, visible, contextEpoch]);
+  }, [meta.bins, meta.epoch, visible, group, contextEpoch]);
 
   const markers = useMemo(() => {
     if (!scale) return [];
@@ -171,7 +173,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     const row = Math.floor(Math.max(0, Math.min(0.999, (clientY - rect.top) / rect.height)) * visible);
     // Inside the lens core one wideband bin covers the whole core, so don't snap to its peak.
     const inCore = scale.lens !== null && Math.abs(frequency - scale.lens.focusHz) <= scale.lens.coreHz;
-    const bins = inCore ? undefined : spectrumRows[spectrumRows.length - 1 - row]?.bins;
+    const bins = inCore ? undefined : spectrumRows[rowForLine(spectrumRows, group, row)]?.bins;
     return pickSignal(frequency, HIT_PX / rect.width * scale.hzPerWidth(x), low, meta.spanHz, bins, sources, exact);
   };
   const pick = (clientX: number, clientY: number, exact: boolean) => {
@@ -195,8 +197,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     for (let hz = Math.ceil(low / tickStep) * tickStep; hz <= low + meta.spanHz; hz += tickStep)
       frequencyTicks.push(hz);
   }
-  const history = spectrumRows.slice(-visible).reverse();
-  const timeTicks = historyTicks(history.map((row) => row.time), visible, height);
+  const timeTicks = historyTicks(lineTimes(spectrumRows, group, visible), visible, height);
 
   return (
     <div className={cn("flex flex-col overflow-hidden bg-[#0f1a2b]", variant === "strip" ? "h-14 rounded-lg" : "h-full min-h-40 rounded-xl", className)}>
@@ -218,6 +219,12 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
           <button type="button" aria-pressed={lensOn} title="Lens: ±20 kHz around the tuned frequency, log scale beyond"
             className={cn("absolute top-0 left-1 rounded px-1.5 leading-5", lensOn ? "bg-[#5eb8c9] text-[#0f1a2b]" : "bg-[#0f1a2b] text-[#c9d4e5] hover:bg-white/10")}
             onClick={() => prefs.set("lens", !lensOn)}>Lens</button>
+          <label className="absolute top-0 left-14 flex h-5 items-center gap-1 rounded bg-[#0f1a2b] px-1" title="Waterfall speed: slower averages rows into each line, faster draws taller lines">
+            <span>Speed</span>
+            <input type="range" min={-3} max={2} step={1} value={speed} aria-valuetext={speedLabel(speed)}
+              className="h-1 w-20 accent-[#5eb8c9]" onChange={(e) => prefs.set("waterfallSpeed", Number(e.target.value))} />
+            <span className="tabular w-8">{speedLabel(speed)}</span>
+          </label>
           <span className="absolute top-0 right-1 bg-[#0f1a2b] px-1">MHz</span>
         </div>
       )}

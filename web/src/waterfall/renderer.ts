@@ -95,6 +95,37 @@ export interface RendererOptions {
   visible: number;
   /** EMA weight of the newest row, 0..1 (1 = no averaging). */
   smoothing?: number;
+  /** Waterfall rows averaged into each screen line (1 = every row its own line). Rows are
+   * grouped by sequence (floor(sequence / group)), so a replay groups them the same way. */
+  group?: number;
+}
+
+/** Running mean of the rows that share one screen line. */
+class LineMean {
+  private sum: Float32Array | null = null;
+  private count = 0;
+  key = NaN;
+  start(key: number, row: Uint8Array) {
+    this.key = key;
+    this.sum = Float32Array.from(row);
+    this.count = 1;
+    return row;
+  }
+  add(row: Uint8Array): Uint8Array {
+    const sum = this.sum!;
+    this.count++;
+    const out = new Uint8Array(row.length);
+    for (let i = 0; i < row.length; i++) {
+      sum[i] += row[i];
+      out[i] = Math.round(sum[i] / this.count);
+    }
+    return out;
+  }
+}
+
+/** Screen-line key for a row: rows with the same key share a line. */
+function lineKey(sequence: number | undefined, group: number) {
+  return group > 1 && sequence !== undefined ? Math.floor(sequence / group) : NaN;
 }
 
 /** Noise floor and peak estimates so the colormap adapts to the data. */
@@ -209,32 +240,56 @@ function webgl(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, o: Rendere
   const levels = new Levels();
   const fineLevels = new Levels();
   const smoother = new Smoother(o.smoothing ?? 1);
-  // Waterfall sequence held in each ring slot, so a fine row lands beside its moment.
-  const slotSequence = new Float64Array(o.capacity).fill(-1);
+  // Waterfall sequences held in each ring slot, so a fine row lands beside its moment.
+  const group = Math.max(1, Math.round(o.group ?? 1));
+  const slotFirst = new Float64Array(o.capacity).fill(-1);
+  const slotLast = new Float64Array(o.capacity).fill(-1);
+  const line = new LineMean();
+  // CPU copy of the fine rows, to average the fine rows that share a line.
+  let fineSum = new Float32Array(0);
+  const fineCount = new Uint16Array(o.capacity);
   let blank = new Uint8Array(fineBins);
   let fineOn = false;
   return {
     push(row, sequence) {
       if (row.length !== o.bins) return;
       const smoothed = smoother.apply(row);
-      levels.update(smoothed);
-      newest = (newest + 1) % o.capacity;
-      slotSequence[newest] = sequence ?? -1;
+      const key = lineKey(sequence, group);
+      let shown: Uint8Array;
+      if (!Number.isNaN(key) && key === line.key) {
+        shown = line.add(smoothed);
+      } else {
+        shown = line.start(key, smoothed);
+        newest = (newest + 1) % o.capacity;
+        slotFirst[newest] = sequence ?? -1;
+        fineCount[newest] = 0;
+        // The slot's old fine row belongs to a moment long gone: 0 means "no fine data".
+        if (blank.length !== fineBins) blank = new Uint8Array(fineBins);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, newest, fineBins, 1, gl.RED, gl.UNSIGNED_BYTE, blank);
+      }
+      slotLast[newest] = sequence ?? -1;
+      levels.update(shown);
       gl.activeTexture(gl.TEXTURE0);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, newest, o.bins, 1, gl.RED, gl.UNSIGNED_BYTE, smoothed);
-      // The slot's old fine row belongs to a moment long gone: 0 means "no fine data".
-      if (blank.length !== fineBins) blank = new Uint8Array(fineBins);
-      gl.activeTexture(gl.TEXTURE2);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, newest, fineBins, 1, gl.RED, gl.UNSIGNED_BYTE, blank);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, newest, o.bins, 1, gl.RED, gl.UNSIGNED_BYTE, shown);
     },
     pushFine(sequence, row) {
       if (!fineOn || row.length !== fineBins) return;
       for (let i = 0; i < o.capacity; i++) {
         const slot = (newest - i + o.capacity) % o.capacity;
-        if (slotSequence[slot] !== sequence) continue;
-        fineLevels.update(row);
+        if (slotFirst[slot] < 0 || sequence < slotFirst[slot] || sequence > slotLast[slot]) continue;
+        if (fineSum.length !== o.capacity * fineBins) fineSum = new Float32Array(o.capacity * fineBins);
+        const sum = fineSum.subarray(slot * fineBins, (slot + 1) * fineBins);
+        if (fineCount[slot] === 0) sum.fill(0);
+        const count = ++fineCount[slot];
+        const shown = new Uint8Array(fineBins);
+        for (let b = 0; b < fineBins; b++) {
+          sum[b] += row[b];
+          shown[b] = Math.max(1, Math.round(sum[b] / count));
+        }
+        fineLevels.update(shown);
         gl.activeTexture(gl.TEXTURE2);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, slot, fineBins, 1, gl.RED, gl.UNSIGNED_BYTE, row);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, slot, fineBins, 1, gl.RED, gl.UNSIGNED_BYTE, shown);
         return;
       }
     },
@@ -287,13 +342,20 @@ function canvas2d(canvas: HTMLCanvasElement, o: RendererOptions): Renderer {
   const history: Uint8Array[] = [];
   const levels = new Levels();
   const smoother = new Smoother(o.smoothing ?? 1);
+  const group = Math.max(1, Math.round(o.group ?? 1));
+  const line = new LineMean();
   let lens: LensUniforms | null = null;
   return {
-    push(row) {
+    push(row, sequence) {
       const smoothed = smoother.apply(row);
-      levels.update(smoothed);
-      history.unshift(smoothed);
-      if (history.length > o.visible) history.pop();
+      const key = lineKey(sequence, group);
+      if (!Number.isNaN(key) && key === line.key && history.length) {
+        history[0] = line.add(smoothed);
+      } else {
+        history.unshift(line.start(key, smoothed));
+        if (history.length > o.visible) history.pop();
+      }
+      levels.update(history[0]);
     },
     // No fine rows here: the fallback stretches the wideband bins only.
     pushFine() {},

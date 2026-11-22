@@ -13,6 +13,8 @@ export interface Prefs {
   volume: number;
   /** Waterfall lens: ±20 kHz around the tuned frequency, log scale beyond. */
   lens: boolean;
+  /** Waterfall speed as a power of two: -3 (1/8x, eight rows a line) to 2 (4x, taller lines). */
+  waterfallSpeed: number;
 }
 
 const KEY = "radio.prefs.v1";
@@ -24,6 +26,7 @@ const defaults: Prefs = {
   theme: "dark",
   volume: 0.8,
   lens: false,
+  waterfallSpeed: 0,
 };
 
 const ids = z.array(z.string());
@@ -36,6 +39,7 @@ const prefsSchema = z.object({
   theme: z.enum(["dark", "light", "system"]).catch(defaults.theme),
   volume: z.number().min(0).max(1).catch(defaults.volume),
   lens: z.boolean().catch(defaults.lens),
+  waterfallSpeed: z.number().int().min(-3).max(2).catch(defaults.waterfallSpeed),
 });
 
 export const prefsStore = createStore<Prefs>(local.read(KEY, prefsSchema, defaults));
