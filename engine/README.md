@@ -132,6 +132,13 @@ Raw chunks carry `raw: true`, `first_sample` and `input_rate_hz` for gap diagnos
 Pre-roll and stale queued audio remain excluded. This is demodulated FM, not IQ, and
 cannot preserve modulation outside the selected channel filter.
 
+`POST /api/tune` also accepts `"mode": "usb"` or `"lsb"` for single-sideband listening (an
+explicit `USB` or `LSB` listener, id `{frequency}-USB-1`). The engine demodulates the sideband
+from the channel's 100 ksps slice (`src/ssb.rs`, see DESIGN-DSP.md) and sends 8 kHz signed16
+audio with a slow AGC, `raw: true` and `mode`. Like raw FM, it bypasses RF, protocol and voice
+gates, never records calls, and is advertised as `capabilities.ssb_audio`. The UI's **Audio mode**
+menu offers USB and LSB beside FM signal and Decoded voice.
+
 The web UI defaults unidentified signals and manual tuning to raw listening, and offers
 **Hear FM signal** for decoded channels. It keeps the latest 120 seconds in browser
 memory; **Save FM audio WAV** downloads a 48 kHz WAV with frequency, processing and transport-gap

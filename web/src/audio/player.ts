@@ -7,11 +7,15 @@ import type { Call, Mode, Source } from "@/domain/model";
 import { createStore } from "@/lib/store";
 import { prefsStore } from "@/state/prefs";
 
+export type Sideband = "usb" | "lsb";
+
 export type Phase = "idle" | "starting" | "waiting" | "playing" | "reconnecting" | "taken" | "error";
 
 export interface PlayerState {
   kind: "idle" | "live" | "call";
   raw: boolean;
+  /** Single-sideband listening (implies raw: no voice gates), or null. */
+  ssb: Sideband | null;
   captureSeconds: number;
   phase: Phase;
   sourceId: string | null;
@@ -45,6 +49,7 @@ export function isAudible(state: PlayerState): boolean {
 const idle = {
   kind: "idle",
   raw: false,
+  ssb: null,
   captureSeconds: 0,
   phase: "idle",
   sourceId: null,
@@ -125,6 +130,7 @@ export class Player {
   private nameFor: ((sourceId: string) => string) | undefined;
   private lastSource: Source | null = null;
   private lastRaw = false;
+  private lastSsb: Sideband | null = null;
   private lastVolume = prefsStore.get().volume || 0.8;
   private blockName = "";
   private onVisible = () => {
@@ -271,17 +277,18 @@ export class Player {
   }
 
   /** Tune a frequency even before it has a catalog entry. Unlock audio in the tap handler. */
-  listenFrequency(frequencyHz: number, raw = true) {
+  listenFrequency(frequencyHz: number, raw = true, ssb: Sideband | null = null) {
     const source = toSources([engineChannelSchema.parse({ id: `tune-${frequencyHz}`,
       frequency_hz: frequencyHz, protocol: "Unknown", in_range: true })], null)[0];
     source.channelIds = [];
-    return this.listen(source, { raw });
+    return this.listen(source, { raw, ssb });
   }
 
   /** Selection is idempotent; Stop is an explicit action. */
-  async listen(source: Source, { toggle = false, raw = source.mode === "unknown" || source.control || (!source.heardVoice && source.encryption !== "encrypted") }: { toggle?: boolean; raw?: boolean } = {}) {
+  async listen(source: Source, { toggle = false, raw = source.mode === "unknown" || source.control || (!source.heardVoice && source.encryption !== "encrypted"), ssb = null }: { toggle?: boolean; raw?: boolean; ssb?: Sideband | null } = {}) {
+    if (ssb) raw = true;
     const current = this.state.get();
-    if (current.kind === "live" && current.sourceId === source.id && current.raw === raw) {
+    if (current.kind === "live" && current.sourceId === source.id && current.raw === raw && current.ssb === ssb) {
       if (current.phase === "starting" || current.phase === "reconnecting") return;
       if (current.phase === "taken") return this.reclaim();
       if (current.phase !== "error") return toggle ? this.stop() : undefined;
@@ -297,11 +304,12 @@ export class Player {
     if (current.kind !== "idle") this.teardown();
     const intent = ++this.intent;
     let channelId = raw ? null : source.channelIds[0] ?? null;
-    this.capture = raw && source.frequencyHz !== null ? new RawCapture(source.frequencyHz) : null;
+    this.capture = raw && !ssb && source.frequencyHz !== null ? new RawCapture(source.frequencyHz) : null;
     this.lastSource = source;
     this.lastRaw = raw;
+    this.lastSsb = ssb;
     const unlocked = this.unlock();
-    this.patch({ ...idle, kind: "live", raw, phase: "starting", sourceId: source.id, sourceName: source.name, frequencyHz: source.frequencyHz, mode: source.mode, slot: source.slot, channelId });
+    this.patch({ ...idle, kind: "live", raw, ssb, phase: "starting", sourceId: source.id, sourceName: source.name, frequencyHz: source.frequencyHz, mode: source.mode, slot: source.slot, channelId });
     this.updateSession(source.name, "Live");
     try {
       await unlocked;
@@ -318,7 +326,8 @@ export class Player {
       const run = this.monitorChain.catch(() => {}).then(async () => {
         if (intent !== this.intent) return;
         if (canTune) {
-          const tuned = await this.backend.tune!(source.frequencyHz!, channelId ?? undefined, raw);
+          const tuned = await (ssb ? this.backend.tune!(source.frequencyHz!, undefined, raw, ssb)
+            : this.backend.tune!(source.frequencyHz!, channelId ?? undefined, raw));
           channelId = tuned.id;
         }
         if (intent !== this.intent) return;
@@ -513,7 +522,7 @@ export class Player {
   }
 
   resume() {
-    if (this.lastSource) return this.listen(this.lastSource, { raw: this.lastRaw });
+    if (this.lastSource) return this.listen(this.lastSource, { raw: this.lastRaw, ssb: this.lastSsb });
   }
 
   listenRaw() {

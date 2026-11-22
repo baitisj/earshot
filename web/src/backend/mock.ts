@@ -504,10 +504,11 @@ export class MockBackend implements Backend {
     };
   }
 
-  async tune(frequencyHz: number, channelId?: string, raw = false) {
-    if (!raw && channelId && this.channels.has(channelId)) return this.channels.get(channelId)!;
-    const id = `${frequencyHz}-${raw ? "Raw" : "Unknown"}-1`;
-    const channel = engineChannelSchema.parse({ id, frequency_hz: frequencyHz, protocol: raw ? "Raw" : "Unknown", in_range: true });
+  async tune(frequencyHz: number, channelId?: string, raw = false, mode?: "usb" | "lsb") {
+    if (!raw && !mode && channelId && this.channels.has(channelId)) return this.channels.get(channelId)!;
+    const protocol = mode ? mode.toUpperCase() : raw ? "Raw" : "Unknown";
+    const id = `${frequencyHz}-${protocol}-1`;
+    const channel = engineChannelSchema.parse({ id, frequency_hz: frequencyHz, protocol, in_range: true });
     this.channels.set(id, channel);
     return channel;
   }
