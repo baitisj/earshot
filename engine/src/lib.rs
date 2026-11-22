@@ -6,6 +6,7 @@ pub mod fm;
 pub mod freq;
 pub mod link;
 mod iq;
+mod opus_live;
 pub mod runtime;
 pub mod ssb;
 pub mod store;

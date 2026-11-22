@@ -191,6 +191,13 @@ explicitly unknown.
 `WS /api/listen` sends one JSON audio descriptor followed by one binary PCM
 message: signed16 little-endian, mono, 8 kHz for voice or 48 kHz for explicit raw listening. Metadata contains `samples`, stable
 `channel_id`, `sequence`, decoder `generation`, and `source_generation`.
+With `?codec=opus` (the web app asks for it where WebCodecs can decode Opus), voice and
+SSB arrive instead as 20 ms Opus packets, about 16 kbit/s at 8 kHz against 128 for PCM:
+each descriptor says `"encoding":"opus"` and gives the packet's `bytes` and `samples`, and
+the binary message is one packet. Each socket has its own encoder, restarted when the
+channel or generation changes. Raw FM stays PCM, because the browser keeps it as a lossless
+capture, and so does anything if the encoder fails. Recordings never pass through Opus.
+libopus comes from pkg-config, or is built from the bundled source with cmake.
 Heartbeats carry generation and selection; explicit `gap` messages flush a slow
 browser's queued audio. Queues hold at most 16 chunks. Ingress age measures time
 since the host received the IQ packet; it is not an aligned speech timestamp.

@@ -272,6 +272,8 @@ async fn spectrum(State(app): State<App>, Query(q): Query<After>) -> Json<Value>
 #[derive(Deserialize)]
 struct Listen {
     channel_id: Option<String>,
+    /// `opus` asks for 20 ms Opus packets instead of PCM for voice and SSB (crate::opus_live).
+    codec: Option<String>,
 }
 /// Audio for one browser. With `?channel_id=` this socket listens to that channel on its
 /// own (several browsers can listen to different channels at once); without it the socket
@@ -279,6 +281,7 @@ struct Listen {
 const MAX_LISTENERS: usize = 16;
 async fn ws(State(app): State<App>, Query(q): Query<Listen>, ws: WebSocketUpgrade) -> axum::response::Response {
     let requested = q.channel_id.filter(|id| !id.is_empty());
+    let opus = q.codec.as_deref() == Some("opus");
     if let Some(id) = &requested {
         let e = app.engine();
         if !e.channels.contains_key(id) {
@@ -304,7 +307,7 @@ async fn ws(State(app): State<App>, Query(q): Query<Listen>, ws: WebSocketUpgrad
     }
     let guard = guard.flatten();
     ws.max_message_size(8192)
-        .on_upgrade(move |s| socket(s, app, requested, guard))
+        .on_upgrade(move |s| socket(s, app, requested, guard, opus))
         .into_response()
 }
 static NEXT_CONNECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -321,8 +324,9 @@ impl Drop for ListenerGuard {
         sync_pins(&mut e);
     }
 }
-async fn socket(mut socket: WebSocket, app: App, requested: Option<String>, _guard: Option<ListenerGuard>) {
+async fn socket(mut socket: WebSocket, app: App, requested: Option<String>, _guard: Option<ListenerGuard>, opus: bool) {
     let joined = Instant::now();
+    let mut live = opus.then(crate::opus_live::LiveOpus::new);
     let mut rx = app.audio.subscribe();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
@@ -334,10 +338,12 @@ async fn socket(mut socket: WebSocket, app: App, requested: Option<String>, _gua
                         let since=if requested.is_some(){joined}else{e.selected_at};
                         e.active&&a.meta["source_generation"]==e.generation&&a.meta["channel_id"].as_str()==want.as_deref()&&a.created>=since};
                     if current {
-        if a.created.elapsed()>Duration::from_millis(250){if socket.send(Message::Text(json!({"type":"gap","reason":"audio_expired"}).to_string().into())).await.is_err(){break;}continue;}
-        let sent=tokio::time::timeout(Duration::from_millis(250),async{socket.send(Message::Text(a.meta.to_string().into())).await?;socket.send(Message::Binary(a.pcm.into())).await}).await;
+        if a.created.elapsed()>Duration::from_millis(250){if let Some(l)=live.as_mut(){l.reset();}if socket.send(Message::Text(json!({"type":"gap","reason":"audio_expired"}).to_string().into())).await.is_err(){break;}continue;}
+        // Opus listeners get 20 ms packets for voice and SSB; raw FM and any encoder error go out as PCM.
+        let frames=match live.as_mut(){Some(l) if crate::opus_live::LiveOpus::takes(&a.meta)=>l.push(&a.meta,&a.pcm).unwrap_or_else(|_|vec![(a.meta.clone(),a.pcm.clone())]),_=>vec![(a.meta,a.pcm)]};
+        let sent=tokio::time::timeout(Duration::from_millis(250),async{for (meta,body) in frames{socket.send(Message::Text(meta.to_string().into())).await?;socket.send(Message::Binary(body.into())).await?;}Ok::<(),axum::Error>(())}).await;
         if !matches!(sent,Ok(Ok(()))){break;}
-        }},Err(broadcast::error::RecvError::Lagged(n))=>{rx=app.audio.subscribe();if socket.send(Message::Text(json!({"type":"gap","dropped_chunks":n}).to_string().into())).await.is_err(){break;}},Err(_)=>break}},
+        }},Err(broadcast::error::RecvError::Lagged(n))=>{rx=app.audio.subscribe();if let Some(l)=live.as_mut(){l.reset();}if socket.send(Message::Text(json!({"type":"gap","dropped_chunks":n}).to_string().into())).await.is_err(){break;}},Err(_)=>break}},
                 _=tick.tick()=>{let value={let e=app.engine();json!({"type":"heartbeat","generation":e.decoder_generation,"source_generation":e.generation,"channel_id":requested.clone().or_else(||e.selected.clone()),"listeners":e.listeners.len()})};if !matches!(tokio::time::timeout(Duration::from_millis(250),socket.send(Message::Text(value.to_string().into()))).await,Ok(Ok(()))){break;}},
                 msg=socket.recv()=>{if matches!(msg,None|Some(Err(_))|Some(Ok(Message::Close(_)))){break;}}
                }
@@ -1237,6 +1243,60 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = app.audio.send(audio("C-1", 7));
         assert_eq!(read_audio(&mut legacy).await, vec![("C-1".to_string(), 7)]);
+    }
+    /// `?codec=opus`: voice goes out as 20 ms Opus packets, raw FM stays PCM, and a socket
+    /// without the parameter still gets PCM.
+    #[tokio::test]
+    async fn opus_listeners_get_packets_for_voice_and_pcm_for_raw() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as Wire;
+        let app = App::new(3);
+        {
+            let mut e = app.engine();
+            e.active = true;
+            e.generation = 5;
+            e.channels.insert("A-1".into(), json!({"id":"A-1","stream_id":1,"in_range":true,"logical_hz":454000001.0,"protocol":"Unknown"}));
+        }
+        let router = router(app.clone(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (mut o, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/api/listen?channel_id=A-1&codec=opus")).await.unwrap();
+        let (mut p, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/api/listen?channel_id=A-1")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let chunk = |rate: u32, n: usize, raw: bool| crate::runtime::Audio {
+            meta: json!({"type":"audio","encoding":"s16le","channels":1,"rate_hz":rate,"samples":n,"channel_id":"A-1","generation":1,"source_generation":5,"sequence":0,"raw":raw}),
+            pcm: (0..n).flat_map(|i| (((i as f64 * 0.3).sin() * 6000.0) as i16).to_le_bytes()).collect(),
+            created: Instant::now(),
+        };
+        let _ = app.audio.send(chunk(8000, 320, false));
+        let _ = app.audio.send(chunk(48000, 480, true));
+        async fn collect(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) -> Vec<(String, u64, usize)> {
+            let mut got = vec![];
+            let mut meta: Option<Value> = None;
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+            while let Ok(Some(Ok(message))) = tokio::time::timeout_at(deadline, ws.next()).await {
+                match message {
+                    Wire::Text(t) => {
+                        let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                        meta = (v["type"] == "audio").then_some(v);
+                    }
+                    Wire::Binary(b) => {
+                        if let Some(m) = meta.take() {
+                            got.push((m["encoding"].as_str().unwrap().to_string(), m["rate_hz"].as_u64().unwrap(), b.len()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            got
+        }
+        let opus = collect(&mut o).await;
+        assert_eq!(opus.len(), 3, "{opus:?}");
+        assert!(opus[..2].iter().all(|(enc, rate, len)| enc == "opus" && *rate == 8000 && *len < 120), "{opus:?}");
+        assert_eq!(opus[2], ("s16le".to_string(), 48000, 960), "raw FM stays PCM");
+        let pcm = collect(&mut p).await;
+        assert_eq!(pcm, vec![("s16le".to_string(), 8000, 640), ("s16le".to_string(), 48000, 960)]);
     }
     #[tokio::test]
     async fn the_listener_cap_holds_under_parallel_handshakes() {

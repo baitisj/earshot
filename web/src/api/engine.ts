@@ -157,11 +157,13 @@ export const engineEventSchema = z.discriminatedUnion("type", [
 ]);
 export type EngineEvent = z.infer<typeof engineEventSchema>;
 
-/** WS /api/listen text messages. A binary PCM message follows each "audio". */
+/** WS /api/listen text messages. A binary message follows each "audio": s16le PCM, or with
+ * `?codec=opus` one 20 ms Opus packet of `bytes` bytes for voice and SSB. */
 export const listenMessageSchema = z.discriminatedUnion("type", [
   z.looseObject({
     type: z.literal("audio"),
-    encoding: z.literal("s16le"),
+    encoding: z.enum(["s16le", "opus"]),
+    bytes: z.number().int().positive().max(4000).optional(),
     channels: z.literal(1),
     rate_hz: z.number().int().positive().max(96000),
     samples: z.number().int().positive(),

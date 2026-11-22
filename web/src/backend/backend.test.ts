@@ -3,6 +3,7 @@ import { HttpBackend } from "./http";
 import { RSP1_HEADER } from "@/api/needs";
 import type { SpectrumBatch } from "@/domain/model";
 import { decodeRsp1, fromJson } from "./spectrum";
+import { resetOpusSupport } from "./opus";
 
 /** What the engine would send; kept here because only tests encode RSP1. */
 function encodeRsp1(batch: SpectrumBatch): ArrayBuffer {
@@ -135,6 +136,64 @@ describe("HttpBackend", () => {
     expect(onAudio).toHaveBeenCalledOnce();
     socket.onmessage!({ data: JSON.stringify({ type: "heartbeat", generation: 1, source_generation: 1, channel_id: null }) });
     expect(onHeartbeat).toHaveBeenCalledWith(null);
+  });
+
+  it("asks for Opus where WebCodecs decodes it and hands the player PCM", () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const decoded: number[][] = [];
+    class FakeChunk {
+      data: ArrayBuffer;
+      constructor(init: { data: ArrayBuffer }) {
+        this.data = init.data;
+      }
+    }
+    class FakeDecoder {
+      state = "configured";
+      private output: (d: unknown) => void;
+      constructor(init: { output: (d: unknown) => void }) {
+        this.output = init.output;
+      }
+      configure(config: { sampleRate: number }) {
+        decoded.push([config.sampleRate]);
+      }
+      decode(chunk: FakeChunk) {
+        // A "decoder" that turns each packet byte into one sample at half scale.
+        const bytes = new Uint8Array(chunk.data);
+        this.output({
+          numberOfFrames: bytes.length,
+          copyTo: (dest: Float32Array) => bytes.forEach((_, i) => (dest[i] = 0.5)),
+          close: () => {},
+        });
+      }
+      close() {
+        this.state = "closed";
+      }
+    }
+    vi.stubGlobal("AudioDecoder", FakeDecoder);
+    vi.stubGlobal("EncodedAudioChunk", FakeChunk);
+    resetOpusSupport(true);
+    const onAudio = vi.fn();
+    new HttpBackend().listen({ onAudio, onHeartbeat: vi.fn(), onGap: vi.fn(), onClose: vi.fn() });
+    const socket = FakeSocket.last;
+    expect(socket.url).toMatch(/\/api\/listen\?codec=opus$/);
+    const descriptor = {
+      type: "audio", encoding: "opus", bytes: 3, channels: 1, rate_hz: 8000, samples: 160,
+      channel_id: "A-1", generation: 1, source_generation: 1, sequence: 1, ingress_age_ms: 3,
+    };
+    socket.onmessage!({ data: JSON.stringify(descriptor) });
+    socket.onmessage!({ data: new Uint8Array([1, 2, 3]).buffer });
+    expect(decoded).toEqual([[8000]]);
+    expect(onAudio).toHaveBeenCalledOnce();
+    expect(onAudio.mock.calls[0][0]).toMatchObject({ encoding: "s16le", samples: 3, channel_id: "A-1" });
+    expect(Array.from(onAudio.mock.calls[0][1] as Int16Array)).toEqual([16384, 16384, 16384]);
+    // A packet whose size doesn't match its descriptor is dropped; raw PCM still passes through.
+    socket.onmessage!({ data: JSON.stringify(descriptor) });
+    socket.onmessage!({ data: new Uint8Array([1, 2]).buffer });
+    socket.onmessage!({ data: JSON.stringify({ ...descriptor, encoding: "s16le", bytes: undefined, rate_hz: 48000, samples: 2, raw: true }) });
+    socket.onmessage!({ data: new Int16Array([7, -7]).buffer });
+    expect(onAudio).toHaveBeenCalledTimes(2);
+    expect(Array.from(onAudio.mock.calls[1][1] as Int16Array)).toEqual([7, -7]);
+    resetOpusSupport(null);
   });
 
   it("surfaces the engine's plain-text monitor errors and JSON detail errors", async () => {

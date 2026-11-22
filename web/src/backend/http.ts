@@ -9,6 +9,7 @@ import {
 } from "@/api/engine";
 import { activitySchema, blocksSchema, callsSchema, catalogSchema } from "@/api/needs";
 import { z } from "zod";
+import { OpusStream, opusSupported, resetOpusSupport } from "./opus";
 import { decodeRsp1, fromJson } from "./spectrum";
 import { BackendError, type Backend, type CallQuery, type ListenHandlers, type Need } from "./types";
 
@@ -159,14 +160,27 @@ export class HttpBackend implements Backend {
   }
 
   listen(handlers: ListenHandlers) {
-    const socket = new WebSocket(wsUrl("/api/listen"));
+    // Opus where WebCodecs can decode it (about 8x less than PCM for voice and SSB); PCM otherwise.
+    const opus = opusSupported()
+      ? new OpusStream(handlers.onAudio, () => {
+          // A decoder failure: fall back to PCM for good and let the player reconnect.
+          resetOpusSupport(false);
+          socket.close();
+        })
+      : null;
+    const socket = new WebSocket(wsUrl(opus ? "/api/listen?codec=opus" : "/api/listen"));
     socket.binaryType = "arraybuffer";
     let pending: AudioDescriptor | null = null;
     socket.onmessage = (message) => {
       if (message.data instanceof ArrayBuffer) {
         const descriptor = pending;
         pending = null;
-        if (!descriptor || message.data.byteLength !== descriptor.samples * 2) return;
+        if (!descriptor) return;
+        if (descriptor.encoding === "opus") {
+          if (opus && message.data.byteLength === descriptor.bytes) opus.decode(descriptor, message.data);
+          return;
+        }
+        if (message.data.byteLength !== descriptor.samples * 2) return;
         handlers.onAudio(descriptor, new Int16Array(message.data));
         return;
       }
@@ -178,7 +192,10 @@ export class HttpBackend implements Backend {
       else if (parsed.type === "heartbeat") handlers.onHeartbeat(parsed.channel_id ?? null);
       else handlers.onGap();
     };
-    socket.onclose = () => handlers.onClose();
+    socket.onclose = () => {
+      opus?.close();
+      handlers.onClose();
+    };
     return { close: () => socket.close() };
   }
 
