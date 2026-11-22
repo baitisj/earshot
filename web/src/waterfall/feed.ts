@@ -16,7 +16,8 @@ export interface SpectrumMeta {
   receivedAt: number;
 }
 
-const MAX_ROWS = 600;
+// Enough for the slowest waterfall speed: 300 lines of 8 rows each.
+const MAX_ROWS = 2400;
 
 /**
  * Recent rows, newest last. Kept outside React (and outside TanStack Query) on

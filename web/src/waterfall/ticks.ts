@@ -22,3 +22,46 @@ export function historyTicks(times: readonly number[], visibleRows: number, heig
   }
   return ticks;
 }
+
+/** Screen geometry for a waterfall speed (a power of two, -3..2): slower speeds average
+ * `group` rows into each line; faster ones show fewer, taller lines. */
+export function speedGeometry(speed: number, baseLines: number) {
+  const s = Math.max(-3, Math.min(2, Math.round(speed)));
+  return s < 0 ? { group: 2 ** -s, lines: baseLines } : { group: 1, lines: Math.max(8, Math.round(baseLines / 2 ** s)) };
+}
+
+export function speedLabel(speed: number) {
+  return speed < 0 ? `1/${2 ** -speed}×` : `${2 ** speed}×`;
+}
+
+/**
+ * Newest-first time of each screen line, grouping rows the way the renderer does
+ * (floor(sequence / group)); each line takes the time of its newest row.
+ */
+export function lineTimes(rows: readonly { sequence: number; time: number }[], group: number, lines: number): number[] {
+  const times: number[] = [];
+  let key = NaN;
+  for (let i = rows.length - 1; i >= 0 && times.length <= lines; i--) {
+    const k = group > 1 ? Math.floor(rows[i].sequence / group) : i;
+    if (k !== key) {
+      times.push(rows[i].time);
+      key = k;
+    }
+  }
+  return times.slice(0, lines);
+}
+
+/** Index into `rows` of the newest row on screen line `line` (0 = newest). */
+export function rowForLine(rows: readonly { sequence: number }[], group: number, line: number): number {
+  if (group <= 1) return rows.length - 1 - line;
+  let key = NaN;
+  let seen = -1;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const k = Math.floor(rows[i].sequence / group);
+    if (k !== key) {
+      key = k;
+      if (++seen === line) return i;
+    }
+  }
+  return -1;
+}
