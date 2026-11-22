@@ -38,6 +38,28 @@ it("tunes an entered frequency, explains silence and reports a receive-window er
   expect(screen.getByRole("status")).toHaveTextContent("Audio off");
 });
 
+it("switches a tuned frequency to USB and LSB single-sideband audio", async () => {
+  const backend = new MockBackend({ manual: true });
+  const tune = vi.spyOn(backend, "tune");
+  const monitor = vi.spyOn(backend, "monitor").mockResolvedValue();
+  vi.spyOn(backend, "listen").mockReturnValue({ close() {} });
+  render(<Providers backend={backend}><LiveSelection /></Providers>);
+  const user = userEvent.setup();
+  await user.type(screen.getByRole("textbox", { name: "Frequency (MHz)" }), "144.2");
+  await user.click(screen.getByRole("button", { name: "Tune" }));
+  await waitFor(() => expect(monitor).toHaveBeenCalledWith("144200000-Raw-1"));
+  const mode = screen.getByRole("combobox", { name: "Audio mode" });
+  await user.selectOptions(mode, "usb");
+  await waitFor(() => expect(monitor).toHaveBeenCalledWith("144200000-USB-1"));
+  expect(tune).toHaveBeenLastCalledWith(144200000, undefined, true, "usb");
+  expect(mode).toHaveValue("usb");
+  await user.selectOptions(mode, "lsb");
+  await waitFor(() => expect(monitor).toHaveBeenCalledWith("144200000-LSB-1"));
+  expect(mode).toHaveValue("lsb");
+  await user.selectOptions(mode, "fm");
+  await waitFor(() => expect(monitor).toHaveBeenLastCalledWith("144200000-Raw-1"));
+});
+
 it("does not offer an empty IQ snapshot or invent the sample range before samples arrive", async () => {
   const backend = Object.assign(new MockBackend({ manual: true }), {
     iqCaptureStatus: vi.fn(async () => ({ samples: 0, seconds: 0, sample_rate_hz: null,

@@ -140,8 +140,8 @@ export class HttpBackend implements Backend {
     await request("/api/monitor", { method: "POST", body: JSON.stringify({ channel_id: channelId }) });
   }
 
-  async tune(frequencyHz: number, channelId?: string, raw = false) {
-    const response = await request("/api/tune", { method: "POST", body: JSON.stringify({ frequency_hz: frequencyHz, channel_id: channelId, raw }) });
+  async tune(frequencyHz: number, channelId?: string, raw = false, mode?: "usb" | "lsb") {
+    const response = await request("/api/tune", { method: "POST", body: JSON.stringify({ frequency_hz: frequencyHz, channel_id: channelId, raw, mode }) });
     return engineChannelSchema.parse(await response.json());
   }
 

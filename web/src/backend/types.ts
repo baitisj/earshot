@@ -47,7 +47,8 @@ export interface Backend {
   /** Select what the engine plays on /api/listen. null clears the selection. */
   monitor(channelId: string | null): Promise<void>;
   /** Operator: add a true-frequency target inside an advertised receiver slice. */
-  tune?(frequencyHz: number, channelId?: string, raw?: boolean): Promise<EngineChannel>;
+  /** `mode` "usb"/"lsb" listens in single sideband (implies raw). */
+  tune?(frequencyHz: number, channelId?: string, raw?: boolean, mode?: "usb" | "lsb"): Promise<EngineChannel>;
   listen(handlers: ListenHandlers): Connection;
   iqCaptureStatus?(channelId: string): Promise<IqCaptureStatus | null>;
   downloadIq?(channelId: string): Promise<Blob>;

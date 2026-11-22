@@ -37,6 +37,7 @@ export function playerLine(state: PlayerState, takenName: string | null): string
     return `Held · ${waiting}${silent ? " · speaker muted" : ""}`;
   }
   if (silent) return "Speaker muted · live audio arriving";
+  if (state.ssb) return `Playing ${state.ssb.toUpperCase()} audio`;
   return state.raw ? "Playing FM signal audio" : "Playing live voice";
 }
 

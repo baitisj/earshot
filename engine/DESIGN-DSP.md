@@ -148,6 +148,29 @@ three consecutive open blocks, and stays muted for 3 s after any DMR/NXDN sync s
 bursts never play as buzz. `fm_noise_squelch_on_real_channels` (ignored, needs the
 recording) reproduces the numbers.
 
+## Single sideband (`src/ssb.rs`)
+
+SSB needs no channelizer change. Bins sit every 50 kHz, so any dial frequency is within 25 kHz of
+a bin centre; USB audio adds 3 kHz, so the worst case reaches 28 kHz from the centre, and the
+prototype filter is flat there (-0.0002 dB) with the worst alias folding into +-28 kHz at
+-94.4 dB (recomputed from the prototype in `fpga/model/channelizer.py`).
+
+Method: mix the centre of the audio passband (dial +- 1.5 kHz) to 0 Hz, low-pass the complex
+signal to +-1.45 kHz, which keeps only the wanted sideband, then mix back by +-1.5 kHz at the
+audio rate and take the real part (the complex-baseband form of Weaver's 1956 third method).
+The opposite sideband lands at -(1.5 kHz + a) and meets the low-pass stopband. Decimation is two
+stages of the same Kaiser resampler: 100 ksps to 20 ksps with aliases kept outside the final
+passband (80 dB), then the sideband filter (pass 1.45 kHz, stop 1.75 kHz, 70 dB) at 20 ksps down
+to 8 kHz for listening or 12 kHz for FT8/WSPR decoders. A narrower band (1.1 to 1.9 kHz) is
+defined for WSPR. `set_correction_hz` retunes the mixer phase-continuously for a future LO drift
+tracker. Cost: about 15 ms of CPU per second of audio per channel.
+
+Tests (`ssb::tests`): a tone lands at its audio frequency within 0.1 dB for dial positions from
+-25 to +25 kHz off the slice centre; the opposite sideband is at least 69 dB down from 400 Hz up;
+a carrier 4 kHz above the dial is more than 65 dB down; LSB mirrors USB; the correction moves a
+tone by exactly the requested Hz. Listening applies a slow AGC (10 ms attack, 500 ms decay) to
+-12 dBFS rms; decoders take the float output without AGC.
+
 ## Carrier estimate (`SliceMeter`)
 
 Each target's carrier is the power-weighted centroid of the bins that stand 4 dB above the

@@ -76,12 +76,15 @@ export function LiveSelection() {
   return <section aria-label="Live tuning" className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-border px-3 py-2">
     <TuneForm key={state.frequencyHz ?? "manual"} initialHz={state.frequencyHz ?? undefined} />
     <select aria-label="Audio mode" className="h-10 rounded-md border border-border bg-card px-2 text-sm"
-      value={state.raw ? "fm" : "decoded"} disabled={!live} onChange={(e) => {
-        const raw = e.target.value === "fm";
-        if (source) void player.listen(source, { raw });
-        else if (state.frequencyHz !== null) void player.listenFrequency(state.frequencyHz, raw);
+      value={state.ssb ?? (state.raw ? "fm" : "decoded")} disabled={!live} onChange={(e) => {
+        const value = e.target.value;
+        const ssb = value === "usb" || value === "lsb" ? value : null;
+        const raw = value !== "decoded";
+        if (source) void player.listen(source, { raw, ssb });
+        else if (state.frequencyHz !== null) void player.listenFrequency(state.frequencyHz, raw, ssb);
       }}>
       <option value="fm">FM signal</option><option value="decoded">Decoded voice</option>
+      <option value="usb">USB (upper sideband)</option><option value="lsb">LSB (lower sideband)</option>
     </select>
     <div className="flex items-center gap-2">
       <Button variant="ghost" size="icon" disabled={!live && !state.channelId}

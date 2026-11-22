@@ -7,6 +7,7 @@ pub mod freq;
 pub mod link;
 mod iq;
 pub mod runtime;
+pub mod ssb;
 pub mod store;
 pub mod voice;
 pub mod wire;
