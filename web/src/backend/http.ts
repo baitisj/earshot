@@ -26,7 +26,9 @@ async function errorText(response: Response): Promise<string> {
 }
 
 async function request(path: string, init?: RequestInit): Promise<Response> {
+  // Live state: never answer a poll from the browser cache.
   const response = await fetch(path, {
+    cache: "no-store",
     ...init,
     headers: init?.body ? { "Content-Type": "application/json", ...init.headers } : init?.headers,
     signal: init?.signal ?? AbortSignal.timeout(8000),
@@ -63,7 +65,7 @@ async function optional<T>(path: string, schema: z.ZodType<T>): Promise<T | null
  */
 async function probe(path: string): Promise<boolean> {
   try {
-    const response = await fetch(path, { signal: AbortSignal.timeout(4000) });
+    const response = await fetch(path, { cache: "no-store", signal: AbortSignal.timeout(4000) });
     return response.ok && !(response.headers.get("content-type") ?? "").includes("text/html");
   } catch {
     return false;
@@ -124,7 +126,7 @@ export class HttpBackend implements Backend {
 
   async spectrum(after: number) {
     if (this.binarySpectrum !== false) {
-      const response = await fetch(`/api/spectrum.bin?after=${after}`, { signal: AbortSignal.timeout(4000) });
+      const response = await fetch(`/api/spectrum.bin?after=${after}`, { cache: "no-store", signal: AbortSignal.timeout(4000) });
       const type = response.headers.get("content-type") ?? "";
       if (response.ok && type.includes("octet-stream")) {
         const batch = decodeRsp1(await response.arrayBuffer());
@@ -156,7 +158,7 @@ export class HttpBackend implements Backend {
   }
 
   async fineSpectrum(channelId: string, after: number) {
-    const response = await fetch(`/api/iq/${encodeURIComponent(channelId)}/spectrum.bin?after=${after}`, { signal: AbortSignal.timeout(4000) });
+    const response = await fetch(`/api/iq/${encodeURIComponent(channelId)}/spectrum.bin?after=${after}`, { cache: "no-store", signal: AbortSignal.timeout(4000) });
     // 410: nothing buffered for this channel (or it left the catalog); 404: an older engine.
     if (response.status === 410 || notBuilt(response.status)) return null;
     if (!response.ok) throw new BackendError(`fine spectrum ${response.status}`, response.status);
