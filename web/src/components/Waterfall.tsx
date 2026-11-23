@@ -8,7 +8,7 @@ import { createRenderer, type Renderer } from "@/waterfall/renderer";
 import { onSpectrumRows, spectrumRows, useSpectrumMeta } from "@/waterfall/feed";
 import { historyTicks, lineTimes, rowForLine, speedGeometry, speedLabel } from "@/waterfall/ticks";
 import { LENS_CORE_HZ, lensScale, lensTicks, lensUniforms, linearScale } from "@/waterfall/lens";
-import { useFineSpectrum } from "@/waterfall/fine";
+import { useFineSpectrum, type FineMiss } from "@/waterfall/fine";
 import { prefs, usePrefs } from "@/state/prefs";
 
 interface Props {
@@ -48,6 +48,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
   const redraw = useRef(() => {});
   const lensOn = usePrefs().lens && variant === "full";
   const [fineLive, setFineLive] = useState(false);
+  const [fineMiss, setFineMiss] = useState<FineMiss>("off");
 
   const low = meta.centerHz !== null && meta.spanHz !== null ? meta.centerHz - meta.spanHz / 2 : null;
   const inWindow = (hz: number | null | undefined): hz is number =>
@@ -67,9 +68,12 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     redraw.current();
   }, [uniforms]);
 
-  useFineSpectrum(lensOn ? iqChannelId ?? null : null, lensOn, (batch) => {
+  useFineSpectrum(lensOn ? iqChannelId ?? null : null, lensOn, (batch, miss) => {
     const r = renderer.current;
     setFineLive(!!batch);
+    setFineMiss(miss ?? "off");
+    // A failed request keeps the rows already drawn; the next good batch carries on.
+    if (miss === "failed") return;
     if (!r) return;
     if (!batch || low === null || !meta.spanHz) {
       r.setFine(null);
@@ -275,7 +279,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       ))}
       {variant === "full" && meta.bins > 0 && meta.spanHz && (
         <span className="pointer-events-none absolute bottom-1 right-1 rounded bg-[#0f1a2b]/85 px-1 text-[10px] text-[#c9d4e5]">{lensOn
-          ? fineLive ? "Lens ±20 kHz · 98 Hz bins" : `Lens ±20 kHz · ${(meta.spanHz / meta.bins / 1000).toFixed(0)} kHz bins (listen for detail)`
+          ? fineLive ? "Lens ±20 kHz · 98 Hz bins" : `Lens ±20 kHz · ${(meta.spanHz / meta.bins / 1000).toFixed(0)} kHz bins (${fineMiss === "failed" ? "detail request failed" : fineMiss === "missing" ? "no IQ for this channel yet" : "listen for detail"})`
           : `${(meta.spanHz / meta.bins / 1000).toFixed(2)} kHz/bin`}</span>
       )}
       {empty && (
