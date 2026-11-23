@@ -959,6 +959,14 @@ async fn set_block(State(app): State<App>, Json(body): Json<Value>) -> ApiResult
     }
 }
 
+/// API answers are live state. Without a Cache-Control header a browser may keep some of
+/// them: Chromium treats a 410 as fresh forever, so a poll that once got "no IQ buffered
+/// yet" would keep getting it from the cache. Responses that set their own policy keep it.
+async fn no_store_by_default(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
+    response
+}
+
 pub fn router(app: App, web_dir: Option<PathBuf>) -> Router {
     let mut router = Router::new()
         .route("/api/status", get(status))
@@ -984,6 +992,7 @@ pub fn router(app: App, web_dir: Option<PathBuf>) -> Router {
         .route("/api/blocks/current", post(set_block))
         .route("/api/listen", get(ws))
         .route("/api/events", get(event_ws))
+        .layer(axum::middleware::map_response(no_store_by_default))
         .with_state(app);
     if let Some(dir) = web_dir {
         router = router.fallback_service(tower_http::services::ServeDir::new(dir));
@@ -995,6 +1004,25 @@ pub fn router(app: App, web_dir: Option<PathBuf>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A browser must never answer a fine-spectrum poll from its cache: Chromium keeps a
+    /// bare 410 forever, which froze the lens on "no IQ for this channel yet".
+    #[tokio::test]
+    async fn api_answers_are_not_cacheable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = App::new(3);
+        app.engine().channels.insert("A-1".into(), json!({"id":"A-1","stream_id":7,"in_range":true,"logical_hz":146e6,"protocol":"Unknown"}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router(app, None)).await.unwrap() });
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(b"GET /api/iq/A-1/spectrum.bin?after=0 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).await.unwrap();
+        let reply = reply.to_ascii_lowercase();
+        assert!(reply.starts_with("http/1.1 410"), "{reply}");
+        assert!(reply.contains("cache-control: no-store"), "{reply}");
+    }
+
     /// Mirrors the required numeric fields of statusSchema in web/src/lib/radio.ts.
     #[tokio::test]
     async fn iq_download_contains_unmodified_samples_and_status_distinguishes_waiting() {
