@@ -181,6 +181,7 @@ export class MockBackend implements Backend {
   private selected: string | null = null;
   private spectrumRows: SpectrumRow[] = [];
   private spectrumSeq = 0;
+  private fineFrom = new Map<string, number>();
   private activity_: WireActivity;
   private timers: ReturnType<typeof setInterval>[] = [];
   private audioOffset = 0;
@@ -368,7 +369,10 @@ export class MockBackend implements Backend {
       .filter((c) => c.rf_active && Math.abs(c.frequency_hz - centerHz) < rateHz / 2)
       .map((c) => ({ hz: c.frequency_hz, level: c.level_db ?? -80, width: 2_500 }));
     carriers.push({ hz: 454_217_000, level: -84, width: 600 }, { hz: 454_260_700, level: -92, width: 150 });
-    const rows = this.spectrumRows.filter((r) => r.sequence > after).slice(-120).map((r) => {
+    // Like the engine, which only has IQ for a slice from when it is listened to.
+    if (!this.fineFrom.has(channelId)) this.fineFrom.set(channelId, this.spectrumSeq);
+    const from = Math.max(after, this.fineFrom.get(channelId)!);
+    const rows = this.spectrumRows.filter((r) => r.sequence > from).slice(-120).map((r) => {
       const levels = new Uint8Array(bins);
       for (let b = 0; b < bins; b++) {
         const hz = centerHz - rateHz / 2 + (b + 0.5) * binHz;

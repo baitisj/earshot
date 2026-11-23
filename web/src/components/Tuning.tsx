@@ -40,7 +40,8 @@ export function TuneForm({ initialHz }: { initialHz?: number }) {
         }
         void client.invalidateQueries({ queryKey: keys.blocks });
       }
-      await player.listenFrequency(target);
+      // Keep the sideband the operator picked; FM and decoded voice start as before.
+      await player.listenFrequency(target, true, player.state.get().ssb);
     },
     onSettled: () => setNote(null),
   });

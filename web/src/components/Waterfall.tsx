@@ -1,4 +1,5 @@
 import { ChannelIdentity } from "@/components/ChannelIdentity";
+import type { Passband } from "@/components/passband";
 import { pickSignal, type WaterfallPick } from "@/waterfall/pick";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatMHz } from "@/domain/adapt";
@@ -8,7 +9,7 @@ import { createRenderer, type Renderer } from "@/waterfall/renderer";
 import { onSpectrumRows, spectrumRows, useSpectrumMeta } from "@/waterfall/feed";
 import { historyTicks, lineTimes, rowForLine, speedGeometry, speedLabel } from "@/waterfall/ticks";
 import { LENS_CORE_HZ, lensScale, lensTicks, lensUniforms, linearScale } from "@/waterfall/lens";
-import { useFineSpectrum } from "@/waterfall/fine";
+import { useFineSpectrum, type FineMiss } from "@/waterfall/fine";
 import { prefs, usePrefs } from "@/state/prefs";
 
 interface Props {
@@ -26,12 +27,14 @@ interface Props {
   captureRange?: { centerHz: number; spanHz: number } | null;
   /** Full view: the listened channel, whose IQ gives the lens its fine detail. */
   iqChannelId?: string | null;
+  /** Full view: the demodulator's passband around the tuned line and the cursor. */
+  passband?: Passband | null;
   className?: string;
 }
 
 const HIT_PX = 22;
 
-export function Waterfall({ variant, sources, talking, activeSourceId, tunedFrequencyHz, onListen, onUnnamed, captureRange, iqChannelId, className }: Props) {
+export function Waterfall({ variant, sources, talking, activeSourceId, tunedFrequencyHz, onListen, onUnnamed, captureRange, iqChannelId, passband, className }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const drag = useRef<{ pointerId: number; lastTune: number; frequency: number | null } | null>(null);
   const box = useRef<HTMLDivElement>(null);
@@ -48,6 +51,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
   const redraw = useRef(() => {});
   const lensOn = usePrefs().lens && variant === "full";
   const [fineLive, setFineLive] = useState(false);
+  const [fineMiss, setFineMiss] = useState<FineMiss>("off");
 
   const low = meta.centerHz !== null && meta.spanHz !== null ? meta.centerHz - meta.spanHz / 2 : null;
   const inWindow = (hz: number | null | undefined): hz is number =>
@@ -67,9 +71,12 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     redraw.current();
   }, [uniforms]);
 
-  useFineSpectrum(lensOn ? iqChannelId ?? null : null, lensOn, (batch) => {
+  useFineSpectrum(lensOn ? iqChannelId ?? null : null, lensOn, (batch, miss) => {
     const r = renderer.current;
     setFineLive(!!batch);
+    setFineMiss(miss ?? "off");
+    // A failed request keeps the rows already drawn; the next good batch carries on.
+    if (miss === "failed") return;
     if (!r) return;
     if (!batch || low === null || !meta.spanHz) {
       r.setFine(null);
@@ -275,7 +282,7 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       ))}
       {variant === "full" && meta.bins > 0 && meta.spanHz && (
         <span className="pointer-events-none absolute bottom-1 right-1 rounded bg-[#0f1a2b]/85 px-1 text-[10px] text-[#c9d4e5]">{lensOn
-          ? fineLive ? "Lens ±20 kHz · 98 Hz bins" : `Lens ±20 kHz · ${(meta.spanHz / meta.bins / 1000).toFixed(0)} kHz bins (listen for detail)`
+          ? fineLive ? "Lens ±20 kHz · 98 Hz bins" : `Lens ±20 kHz · ${(meta.spanHz / meta.bins / 1000).toFixed(0)} kHz bins (${fineMiss === "failed" ? "detail request failed" : fineMiss === "missing" ? "no IQ for this channel yet" : "listen for detail"})`
           : `${(meta.spanHz / meta.bins / 1000).toFixed(2)} kHz/bin`}</span>
       )}
       {empty && (
@@ -306,10 +313,16 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
           style={captureStyle(captureRange, scale!)} />
       )}
       {variant === "full" && tunedFrequencyHz != null && low !== null && meta.spanHz && tunedFrequencyHz >= low && tunedFrequencyHz <= low + meta.spanHz && (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-0.5 bg-[#5eb8c9]" style={{ left: `${scale!.x(tunedFrequencyHz) * 100}%` }} />
+        <>
+          {passband && <span aria-hidden data-passband="tuned" className="pointer-events-none absolute inset-y-0 border-x border-[#5eb8c9]/60 bg-[#5eb8c9]/10" style={bandStyle(tunedFrequencyHz, passband, scale!)} />}
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 w-0.5 bg-[#5eb8c9]" style={{ left: `${scale!.x(tunedFrequencyHz) * 100}%` }} />
+        </>
       )}
       {variant === "full" && hover !== null && low !== null && meta.spanHz && (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-px bg-white/70" style={{ left: `${scale!.x(hover.frequencyHz) * 100}%` }} />
+        <>
+          {passband && <span aria-hidden data-passband="cursor" className="pointer-events-none absolute inset-y-0 border-x border-dashed border-white/50 bg-white/5" style={bandStyle(hover.frequencyHz, passband, scale!)} />}
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 w-px bg-white/70" style={{ left: `${scale!.x(hover.frequencyHz) * 100}%` }} />
+        </>
       )}
       {variant === "full" && hover !== null && (
         <span className="tabular pointer-events-none absolute bottom-2 left-2 rounded bg-[#0f1a2b]/85 px-1.5 py-0.5 text-xs text-[#f2f5fa]">
@@ -319,6 +332,13 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     </div>
     </div>
   );
+}
+
+/** A passband around a frequency on screen; at least 3 px wide so it shows on a wide window. */
+function bandStyle(hz: number, band: Passband, scale: { x(hz: number): number }) {
+  const left = scale.x(hz + band.lowHz);
+  const right = scale.x(hz + band.highHz);
+  return { left: `${left * 100}%`, width: `max(3px, ${Math.max(0, right - left) * 100}%)` };
 }
 
 /** The capture range's band on screen, clipped to the window (and to the screen under a lens). */
