@@ -250,7 +250,9 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
       } : undefined}
       onPointerUp={interactive ? (e) => {
         if (drag.current?.pointerId !== e.pointerId) return;
-        pick(e.clientX, e.clientY, e.shiftKey);
+        // Under the lens the press already tuned and re-centred the scale, so the same
+        // screen position now means another frequency: tune once per press.
+        if (!lensOn) pick(e.clientX, e.clientY, e.shiftKey);
         drag.current = null;
         if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId);
       } : undefined}

@@ -339,28 +339,43 @@ function webgl(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, o: Rendere
 
 function canvas2d(canvas: HTMLCanvasElement, o: RendererOptions): Renderer {
   const ctx = canvas.getContext("2d");
-  const history: Uint8Array[] = [];
+  // Newest first: each screen line, the sequences it holds, and its fine row (mean so far).
+  const history: { row: Uint8Array; first: number; last: number; fine: Float32Array | null; fineCount: number }[] = [];
   const levels = new Levels();
+  const fineLevels = new Levels();
   const smoother = new Smoother(o.smoothing ?? 1);
   const group = Math.max(1, Math.round(o.group ?? 1));
   const line = new LineMean();
   let lens: LensUniforms | null = null;
+  let fine: FineGeometry | null = null;
   return {
     push(row, sequence) {
       const smoothed = smoother.apply(row);
       const key = lineKey(sequence, group);
+      const seq = sequence ?? -1;
       if (!Number.isNaN(key) && key === line.key && history.length) {
-        history[0] = line.add(smoothed);
+        history[0].row = line.add(smoothed);
+        history[0].last = seq;
       } else {
-        history.unshift(line.start(key, smoothed));
+        history.unshift({ row: line.start(key, smoothed), first: seq, last: seq, fine: null, fineCount: 0 });
         if (history.length > o.visible) history.pop();
       }
-      levels.update(history[0]);
+      levels.update(history[0].row);
     },
-    // No fine rows here: the fallback stretches the wideband bins only.
-    pushFine() {},
+    pushFine(sequence, row) {
+      if (!fine || row.length !== fine.bins) return;
+      const entry = history.find((h) => h.first >= 0 && sequence >= h.first && sequence <= h.last);
+      if (!entry) return;
+      if (!entry.fine || entry.fine.length !== row.length) {
+        entry.fine = new Float32Array(row.length);
+        entry.fineCount = 0;
+      }
+      entry.fineCount++;
+      for (let b = 0; b < row.length; b++) entry.fine[b] += row[b];
+      fineLevels.update(Uint8Array.from(entry.fine, (v) => Math.round(v / entry.fineCount)));
+    },
     setLens(next) { lens = next; },
-    setFine() {},
+    setFine(geometry) { fine = geometry; },
     resize(width, height) {
       canvas.width = width;
       canvas.height = height;
@@ -368,30 +383,47 @@ function canvas2d(canvas: HTMLCanvasElement, o: RendererOptions): Renderer {
     draw() {
       if (!ctx || !history.length) return;
       const width = lens ? Math.max(1, Math.min(canvas.width, 2048)) : o.bins;
-      // Bin shown in each output column (-1: outside the window).
-      const column = Int32Array.from({ length: width }, (_, x) => {
-        if (!lens) return x;
+      // Per output column: the wideband bin (-1: outside the window) and, inside the lens
+      // core where fine rows exist, the fine bin (-1: none). Same mapping as the shader.
+      const column = new Int32Array(width);
+      const fineColumn = new Int32Array(width).fill(-1);
+      for (let x = 0; x < width; x++) {
+        if (!lens) {
+          column[x] = x;
+          continue;
+        }
         const sx = (x + 0.5) / width;
         const u = Math.abs(sx - 0.5) * 2;
         const d = u <= lens.core ? lens.coreSpan * u / lens.core : lens.coreSpan + lens.b * Math.expm1(lens.k * (u - lens.core));
         const f = lens.focus + Math.sign(sx - 0.5) * d;
-        return f < 0 || f > 1 ? -1 : Math.min(o.bins - 1, Math.floor(f * o.bins));
-      });
+        column[x] = f < 0 || f > 1 ? -1 : Math.min(o.bins - 1, Math.floor(f * o.bins));
+        if (fine && column[x] >= 0 && Math.abs(f - lens.focus) <= fine.reach) {
+          const fu = 0.5 + (f - fine.center) / fine.width;
+          if (fu >= 0.15 && fu <= 0.85) fineColumn[x] = Math.min(fine.bins - 1, Math.floor(fu * fine.bins));
+        }
+      }
       const image = ctx.createImageData(width, o.visible);
       const span = Math.max(0.02, levels.ceil - levels.floor);
-      history.forEach((row, y) => {
+      const fineSpan = Math.max(0.02, fineLevels.ceil - fineLevels.floor);
+      const paint = (i: number, t: number) => {
+        const c = Math.round(Math.min(1, Math.max(0, t)) * 255) * 4;
+        image.data[i] = COLORMAP[c];
+        image.data[i + 1] = COLORMAP[c + 1];
+        image.data[i + 2] = COLORMAP[c + 2];
+        image.data[i + 3] = 255;
+      };
+      history.forEach((entry, y) => {
         for (let x = 0; x < width; x++) {
           const i = (y * width + x) * 4;
           if (column[x] < 0) {
             image.data.set([15, 26, 43, 255], i);
             continue;
           }
-          const t = Math.min(1, Math.max(0, (row[column[x]] / 255 - levels.floor) / span));
-          const c = Math.round(t * 255) * 4;
-          image.data[i] = COLORMAP[c];
-          image.data[i + 1] = COLORMAP[c + 1];
-          image.data[i + 2] = COLORMAP[c + 2];
-          image.data[i + 3] = 255;
+          if (fineColumn[x] >= 0 && entry.fine && entry.fineCount) {
+            paint(i, (entry.fine[fineColumn[x]] / entry.fineCount / 255 - fineLevels.floor) / fineSpan);
+            continue;
+          }
+          paint(i, (entry.row[column[x]] / 255 - levels.floor) / span);
         }
       });
       const scratch = new OffscreenCanvas(width, o.visible);

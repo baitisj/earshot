@@ -10,7 +10,7 @@ import type { WireActivity, WireBlocks, WireCall, WireCatalogEntry } from "@/api
 import type { SpectrumBatch, SpectrumRow } from "@/domain/model";
 import { STARTER_CATALOG } from "@/domain/starter";
 import { scaleToByte } from "./spectrum";
-import { BackendError, type Backend, type CallQuery, type ListenHandlers, type Need } from "./types";
+import { BackendError, type Backend, type CallQuery, type FineSpectrum, type ListenHandlers, type Need } from "./types";
 
 export function mulberry32(seed: number) {
   let a = seed >>> 0;
@@ -353,6 +353,35 @@ export class MockBackend implements Backend {
       const on = !c.rf_active;
       this.update(id, { rf_active: on, level_db: on ? -88 - this.rand() * 10 : -118, last_rf: on ? now / 1000 : c.last_rf });
     }
+  }
+
+  /** Fine rows (FSP1 shape) for a listened channel: a 100 kHz slice off-centre from it, with
+   * narrow carriers where the wideband picture has them, so the lens has detail in demo mode. */
+  async fineSpectrum(channelId: string, after: number): Promise<FineSpectrum | null> {
+    const channel = this.channels.get(channelId);
+    if (!channel || this.state !== "receiving") return null;
+    const bins = 1024;
+    const rateHz = 100_000;
+    const centerHz = channel.frequency_hz - 7_000;
+    const binHz = rateHz / bins;
+    const carriers = [...this.channels.values()]
+      .filter((c) => c.rf_active && Math.abs(c.frequency_hz - centerHz) < rateHz / 2)
+      .map((c) => ({ hz: c.frequency_hz, level: c.level_db ?? -80, width: 2_500 }));
+    carriers.push({ hz: 454_217_000, level: -84, width: 600 }, { hz: 454_260_700, level: -92, width: 150 });
+    const rows = this.spectrumRows.filter((r) => r.sequence > after).slice(-120).map((r) => {
+      const levels = new Uint8Array(bins);
+      for (let b = 0; b < bins; b++) {
+        const hz = centerHz - rateHz / 2 + (b + 0.5) * binHz;
+        let db = -138 + (this.rand() - 0.5) * 6;
+        for (const c of carriers) {
+          const d = (hz - c.hz) / c.width;
+          if (Math.abs(d) < 3) db = Math.max(db, c.level - 20 - d * d * 6 + (this.rand() - 0.5) * 2);
+        }
+        levels[b] = Math.max(1, Math.min(255, Math.round(1 + 254 * (db + 160) / 160)));
+      }
+      return { sequence: r.sequence, bins: levels };
+    });
+    return { centerHz, rateHz, lowDb: -160, highDb: 0, sequence: this.spectrumSeq, bins, rows };
   }
 
   private spectrumRow(time: number) {
