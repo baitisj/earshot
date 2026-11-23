@@ -100,6 +100,11 @@ export interface RendererOptions {
   group?: number;
 }
 
+/** Fine rows from another IQ slice sit at other frequencies: a new slice starts them over. */
+function sameSlice(a: FineGeometry | null, b: FineGeometry | null) {
+  return !!a && !!b && a.bins === b.bins && Math.abs(a.center - b.center) < 1e-9 && Math.abs(a.width - b.width) < 1e-9;
+}
+
 /** Running mean of the rows that share one screen line. */
 class LineMean {
   private sum: Float32Array | null = null;
@@ -212,6 +217,7 @@ function webgl(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, o: Rendere
 
   let fine: WebGLTexture | null = null;
   let fineBins = 0;
+  let fineGeometry: FineGeometry | null = null;
   const allocFine = (bins: number) => {
     if (fine && fineBins === bins) return;
     if (fine) gl.deleteTexture(fine);
@@ -306,9 +312,15 @@ function webgl(canvas: HTMLCanvasElement, gl: WebGL2RenderingContext, o: Rendere
       fineOn = !!geometry;
       gl.uniform1i(u("fineOn"), geometry ? 1 : 0);
       if (!geometry) return;
-      if (geometry.bins !== fineBins) {
+      // Rows kept from another slice would be drawn at this slice's frequencies: drop them, so
+      // history shows the stretched wideband rows and fine rows fill in from the top.
+      if (!sameSlice(fineGeometry, geometry)) {
+        fineGeometry = geometry;
         allocFine(geometry.bins);
         blank = new Uint8Array(fineBins);
+        gl.activeTexture(gl.TEXTURE2);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, fineBins, o.capacity, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(fineBins * o.capacity));
+        fineCount.fill(0);
       }
       gl.uniform1f(u("fineCenter"), geometry.center);
       gl.uniform1f(u("fineWidth"), geometry.width);
@@ -375,7 +387,11 @@ function canvas2d(canvas: HTMLCanvasElement, o: RendererOptions): Renderer {
       fineLevels.update(Uint8Array.from(entry.fine, (v) => Math.round(v / entry.fineCount)));
     },
     setLens(next) { lens = next; },
-    setFine(geometry) { fine = geometry; },
+    setFine(geometry) {
+      // As in the WebGL path: rows from another slice are dropped, not moved.
+      if (geometry && !sameSlice(fine, geometry)) for (const entry of history) { entry.fine = null; entry.fineCount = 0; }
+      fine = geometry;
+    },
     resize(width, height) {
       canvas.width = width;
       canvas.height = height;

@@ -9,16 +9,19 @@ import { onSpectrumRows, spectrumRows } from "./feed";
  * the same moment. `onBatch(null)` means there is no fine data (nothing listened, an older
  * engine, or the channel's IQ is not buffered).
  */
-export function useFineSpectrum(channelId: string | null, enabled: boolean, onBatch: (batch: FineSpectrum | null) => void) {
+/** Why there is no fine batch: lens off or nothing listened, the engine has no IQ for the channel, or the request failed. */
+export type FineMiss = "off" | "missing" | "failed";
+
+export function useFineSpectrum(channelId: string | null, enabled: boolean, onBatch: (batch: FineSpectrum | null, miss?: FineMiss) => void) {
   const backend = useBackend();
   const callback = useRef(onBatch);
   useEffect(() => {
     callback.current = onBatch;
   });
   useEffect(() => {
-    const emit = (batch: FineSpectrum | null) => callback.current(batch);
+    const emit = (batch: FineSpectrum | null, miss?: FineMiss) => callback.current(batch, miss);
     if (!enabled || !channelId || !backend.fineSpectrum) {
-      emit(null);
+      emit(null, "off");
       return;
     }
     let after = Math.max(0, (spectrumRows[0]?.sequence ?? 1) - 1);
@@ -40,15 +43,17 @@ export function useFineSpectrum(channelId: string | null, enabled: boolean, onBa
         if (disposed) return;
         if (!batch) {
           missedAt = performance.now();
-          emit(null);
+          emit(null, "missing");
           return;
         }
         // Moments up to the engine's newest sequence are done, with or without IQ behind them;
         // a smaller sequence means the engine restarted.
         after = batch.sequence;
         emit(batch);
-      } catch {
+      } catch (error) {
         missedAt = performance.now();
+        console.debug("fine spectrum", channelId, error);
+        emit(null, "failed");
       } finally {
         busy = false;
         if (again && !disposed) {
