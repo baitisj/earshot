@@ -1,4 +1,5 @@
 import { ChannelIdentity } from "@/components/ChannelIdentity";
+import type { Passband } from "@/components/passband";
 import { pickSignal, type WaterfallPick } from "@/waterfall/pick";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatMHz } from "@/domain/adapt";
@@ -26,12 +27,14 @@ interface Props {
   captureRange?: { centerHz: number; spanHz: number } | null;
   /** Full view: the listened channel, whose IQ gives the lens its fine detail. */
   iqChannelId?: string | null;
+  /** Full view: the demodulator's passband around the tuned line and the cursor. */
+  passband?: Passband | null;
   className?: string;
 }
 
 const HIT_PX = 22;
 
-export function Waterfall({ variant, sources, talking, activeSourceId, tunedFrequencyHz, onListen, onUnnamed, captureRange, iqChannelId, className }: Props) {
+export function Waterfall({ variant, sources, talking, activeSourceId, tunedFrequencyHz, onListen, onUnnamed, captureRange, iqChannelId, passband, className }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const drag = useRef<{ pointerId: number; lastTune: number; frequency: number | null } | null>(null);
   const box = useRef<HTMLDivElement>(null);
@@ -310,10 +313,16 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
           style={captureStyle(captureRange, scale!)} />
       )}
       {variant === "full" && tunedFrequencyHz != null && low !== null && meta.spanHz && tunedFrequencyHz >= low && tunedFrequencyHz <= low + meta.spanHz && (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-0.5 bg-[#5eb8c9]" style={{ left: `${scale!.x(tunedFrequencyHz) * 100}%` }} />
+        <>
+          {passband && <span aria-hidden data-passband="tuned" className="pointer-events-none absolute inset-y-0 border-x border-[#5eb8c9]/60 bg-[#5eb8c9]/10" style={bandStyle(tunedFrequencyHz, passband, scale!)} />}
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 w-0.5 bg-[#5eb8c9]" style={{ left: `${scale!.x(tunedFrequencyHz) * 100}%` }} />
+        </>
       )}
       {variant === "full" && hover !== null && low !== null && meta.spanHz && (
-        <span aria-hidden className="pointer-events-none absolute inset-y-0 w-px bg-white/70" style={{ left: `${scale!.x(hover.frequencyHz) * 100}%` }} />
+        <>
+          {passband && <span aria-hidden data-passband="cursor" className="pointer-events-none absolute inset-y-0 border-x border-dashed border-white/50 bg-white/5" style={bandStyle(hover.frequencyHz, passband, scale!)} />}
+          <span aria-hidden className="pointer-events-none absolute inset-y-0 w-px bg-white/70" style={{ left: `${scale!.x(hover.frequencyHz) * 100}%` }} />
+        </>
       )}
       {variant === "full" && hover !== null && (
         <span className="tabular pointer-events-none absolute bottom-2 left-2 rounded bg-[#0f1a2b]/85 px-1.5 py-0.5 text-xs text-[#f2f5fa]">
@@ -323,6 +332,13 @@ export function Waterfall({ variant, sources, talking, activeSourceId, tunedFreq
     </div>
     </div>
   );
+}
+
+/** A passband around a frequency on screen; at least 3 px wide so it shows on a wide window. */
+function bandStyle(hz: number, band: Passband, scale: { x(hz: number): number }) {
+  const left = scale.x(hz + band.lowHz);
+  const right = scale.x(hz + band.highHz);
+  return { left: `${left * 100}%`, width: `max(3px, ${Math.max(0, right - left) * 100}%)` };
 }
 
 /** The capture range's band on screen, clipped to the window (and to the screen under a lens). */
